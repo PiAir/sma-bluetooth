@@ -24,7 +24,6 @@
 #include <sys/socket.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
-#include <errno.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -33,8 +32,6 @@
 #include <curl/curl.h>
 #include "repost.h"
 #include "sma_mysql.h"
-#include <libxml2/libxml/parser.h>
-#include <libxml2/libxml/xpath.h>
 
 
 /*
@@ -46,15 +43,22 @@ typedef u_int16_t u16;
 #define PPPINITFCS16 0xffff /* Initial FCS value    */
 #define PPPGOODFCS16 0xf0b8 /* Good final FCS value */
 #define ASSERT(x) assert(x)
-#define SCHEMA "4"  /* Current database schema */
+#define SCHEMA "2"  /* Current database schema */
 #define _XOPEN_SOURCE /* glibc2 needs this */
 
+typedef struct{
+    unsigned int 	key1;
+    unsigned int 	key2;
+    char		description[20];
+    char		units[20];
+    float		divisor;
+} ReturnType;
 
 char *accepted_strings[] = {
 "$END",
 "$ADDR",
 "$TIME",
-"$SERIAL",
+"$SER",
 "$CRC",
 "$POW",
 "$DTOT",
@@ -72,20 +76,16 @@ char *accepted_strings[] = {
 "$ARCHIVEDATA1",
 "$PASSWORD",
 "$SIGNAL",
-"$SUSYID",
+"$UNKNOWN",
 "$INVCODE",
 "$ARCHCODE",
 "$INVERTERDATA",
 "$CNT",        /*Counter of sent packets*/
 "$TIMEZONE",    /*Timezone seconds +1 from GMT*/
-"$TIMESET",    /*Unknown string involved in time setting*/
-"$DATA",        /*Data string */
-"$MYSUSYID",
-"$MYSERIAL",
-"$LOGIN"
+"$TIMESET"    /*Unknown string involved in time setting*/
 };
 
-int cc;
+int cc,debug = 0,verbose=0;
 unsigned char fl[1024] = { 0 };
 
 
@@ -159,16 +159,6 @@ strip_escapes(unsigned char *cp, int *len)
    }
 }
 
-int quick_pow10(int n)
-{
-    static int pow10[10] = {
-        1, 10, 100, 1000, 10000, 
-        100000, 1000000, 10000000, 100000000, 1000000000
-    };
-
-    return pow10[n]; 
-}
-
 /*
  * Add escapes (7D) as they are required
  */
@@ -196,23 +186,21 @@ add_escapes(unsigned char *cp, int *len)
  * Recalculate and update length to correct for escapes
  */
 void
-fix_length_send( FlagType * flag, unsigned char *cp, int *len)
+fix_length_send(unsigned char *cp, int *len)
 {
     int	    delta=0;
 
-    if( flag->debug == 1 ) 
+    if( debug == 1 ) 
        printf( "sum=%x\n", cp[1]+cp[3] );
     if(( cp[1] != (*len)+1 ))
     {
       delta = (*len)+1 - cp[1];
-      if( flag->debug == 1 ) {
+      if( debug == 1 ) {
           printf( "  length change from %x to %x diff=%x \n", cp[1],(*len)+1,cp[1]+cp[3] );
       }
       cp[3] = (cp[1]+cp[3])-((*len)+1);
       cp[1] =(*len)+1;
 
-      cp[3]=cp[0]^cp[1]^cp[2];
-      /*
       switch( cp[1] ) {
         case 0x3a: cp[3]=0x44; break;
         case 0x3b: cp[3]=0x43; break;
@@ -242,8 +230,7 @@ fix_length_send( FlagType * flag, unsigned char *cp, int *len)
         case 0x62: cp[3]=0x1e; break;
         default: printf( "NO CONVERSION!" );getchar();break;
       }
-      */
-      if( flag->debug == 1 ) 
+      if( debug == 1 ) 
          printf( "new sum=%x\n", cp[1]+cp[3] );
     }
 }
@@ -252,7 +239,7 @@ fix_length_send( FlagType * flag, unsigned char *cp, int *len)
  * Recalculate and update length to correct for escapes
  */
 void
-fix_length_received(FlagType * flag, unsigned char *received, int *len)
+fix_length_received(unsigned char *received, int *len)
 {
     int	    delta=0;
     int	    sum;
@@ -260,9 +247,9 @@ fix_length_received(FlagType * flag, unsigned char *received, int *len)
     if( received[1] != (*len) )
     {
       sum = received[1]+received[3];
-      if (flag->debug == 1) printf( "sum=%x", sum );
+      if (debug == 1) printf( "sum=%x", sum );
       delta = (*len) - received[1];
-      if (flag->debug == 1) printf( "length change from %x to %x\n", received[1], (*len) );
+      if (debug == 1) printf( "length change from %x to %x\n", received[1], (*len) );
       if(( received[3] != 0x13 )&&( received[3] != 0x14 )) { 
         received[1] = (*len);
         switch( received[1] ) {
@@ -280,7 +267,7 @@ fix_length_received(FlagType * flag, unsigned char *received, int *len)
  * How to use the fcs
  */
 void
-tryfcs16(FlagType * flag, unsigned char *cp, int len, unsigned char *fl, int * cc)
+tryfcs16(unsigned char *cp, int len)
 {
     u16 trialfcs;
     unsigned
@@ -289,17 +276,17 @@ tryfcs16(FlagType * flag, unsigned char *cp, int len, unsigned char *fl, int * c
 
     memcpy( stripped, cp, len );
     /* add on output */
-    if (flag->debug ==2){
+    if (debug ==2){
  	printf("String to calculate FCS\n");	 
         	for (i=0;i<len;i++) printf("%02x ",cp[i]);
 	 	printf("\n\n");
     }	
     trialfcs = pppfcs16( PPPINITFCS16, stripped, len );
     trialfcs ^= 0xffff;               /* complement */
-    fl[(*cc)] = (trialfcs & 0x00ff);    /* least significant byte first */
-    fl[(*cc)+1] = ((trialfcs >> 8) & 0x00ff);
-    (*cc)+=2;
-    if (flag->debug == 2 ){ 
+    fl[cc] = (trialfcs & 0x00ff);    /* least significant byte first */
+    fl[cc+1] = ((trialfcs >> 8) & 0x00ff);
+    cc+=2;
+    if (debug == 2 ){ 
 	printf("FCS = %x%x %x\n",(trialfcs & 0x00ff),((trialfcs >> 8) & 0x00ff), trialfcs); 
     }
 }
@@ -353,7 +340,7 @@ unsigned char conv(char *nn)
 }
 
 int
-check_send_error( FlagType * flag, int *s, int *rr, unsigned char *received, int cc, unsigned char *last_sent, int *terminated, int *already_read )
+check_send_error( ConfType * conf, int *s, int *rr, unsigned char *received, int cc, unsigned char *last_sent, int *terminated, int *already_read )
 {
     int bytes_read,i,j;
     unsigned char buf[1024]; /*read buffer*/
@@ -377,13 +364,13 @@ check_send_error( FlagType * flag, int *s, int *rr, unsigned char *received, int
 	(*rr) = 0;
         for( i=0; i<sizeof(header); i++ ) {
             received[(*rr)] = header[i];
-	    if (flag->debug == 1) printf("%02x ", received[(*rr)]);
+	    if (debug == 1) printf("%02x ", received[(*rr)]);
             (*rr)++;
         }
     }
     else
     {
-       if( flag->verbose==1) printf("Timeout reading bluetooth socket\n");
+       if( verbose==1) printf("Timeout reading bluetooth socket\n");
        (*rr) = 0;
        memset(received,0,1024);
        return -1;
@@ -393,14 +380,14 @@ check_send_error( FlagType * flag, int *s, int *rr, unsigned char *received, int
     }
     else
     {
-       if( flag->verbose==1) printf("Timeout reading bluetooth socket\n");
+       if( verbose==1) printf("Timeout reading bluetooth socket\n");
        (*rr) = 0;
        memset(received,0,1024);
        return -1;
     }
     if ( bytes_read > 0){
-	if (flag->debug == 1){ 
-           printf("\nReceiving\n");
+        if (debug == 1) printf("\nReceiving\n");
+	if (debug == 1){ 
            printf( "    %08x: .. .. .. .. .. .. .. .. .. .. .. .. ", 0 );
            j=12;
            for( i=0; i<sizeof(header); i++ ) {
@@ -447,202 +434,26 @@ check_send_error( FlagType * flag, int *s, int *rr, unsigned char *received, int
 	    else { 
                received[(*rr)] = buf[i];
             }
-	    if (flag->debug == 1) printf("%02x ", received[(*rr)]);
+	    if (debug == 1) printf("%02x ", received[(*rr)]);
 	    (*rr)++;
 	}
-        fix_length_received( flag, received, rr );
-	if (flag->debug == 1) {
+        fix_length_received( received, rr );
+	if (debug == 1) {
 	    printf("\n");
             for( i=0;i<(*rr); i++ ) printf("%02x ", received[(i)]);
         }
-	if (flag->debug == 1) printf("\n\n");
+	if (debug == 1) printf("\n\n");
         (*already_read)=1;
     }	
     return 0;
 }
 
 int
-empty_read_bluetooth(  ConfType * conf, FlagType * flag, ReadRecordType * readRecord, int *s, int *rr, unsigned char *received, int cc, unsigned char *last_sent, int *terminated )
+read_bluetooth( ConfType * conf, int *s, int *rr, unsigned char *received, int cc, unsigned char *last_sent, int *terminated )
 {
-    int bytes_read,i,j, last_decoded;
+    int bytes_read,i,j;
     unsigned char buf[1024]; /*read buffer*/
-    unsigned char header[4]; /*read buffer*/
-    unsigned char checkbit;
-    struct timeval tv;
-    fd_set readfds;
-
-    tv.tv_sec = 1; // set timeout of reading
-    tv.tv_usec = 0;
-    memset(buf,0,1024);
-
-    FD_ZERO(&readfds);
-    FD_SET((*s), &readfds);
-				
-    if( select((*s)+1, &readfds, NULL, NULL, &tv) <  0) {
-        printf( "select error has occurred" ); getchar();
-    }
-
-				
-    (*terminated) = 0; // Tag to tell if string has 7e termination
-    // first read the header to get the record length
-    if (FD_ISSET((*s), &readfds)){	// did we receive anything within 5 seconds
-        bytes_read = recv((*s), header, sizeof(header), 0); //Get length of string
-	(*rr) = 0;
-        for( i=0; i<sizeof(header); i++ ) {
-            received[(*rr)] = header[i];
-	    if (flag->debug == 2) printf("%02x ", received[i]);
-            (*rr)++;
-        }
-    }
-    else
-    {
-       memset(received,0,1024);
-       (*rr)=0;
-       return -1;
-    }
-    if (FD_ISSET((*s), &readfds)){	// did we receive anything within 5 seconds
-        bytes_read = recv((*s), buf, header[1]-3, 0); //Read the length specified by header
-    }
-    else
-    {
-       memset(received,0,1024);
-       (*rr)=0;
-       return -1;
-    }
-    readRecord->Status[0]=0;
-    readRecord->Status[1]=0;
-    if ( bytes_read > 0){
-	if (flag->debug == 1){ 
-           /*
-           printf("\nReceiving\n");
-           printf( "    %08x: .. .. .. .. .. .. .. .. .. .. .. .. ", 0 );
-           j=12;
-           for( i=0; i<sizeof(header); i++ ) {
-              if( j%16== 0 )
-                 printf( "\n    %08x: ",j);
-              printf("%02x ",header[i]);
-              j++;
-           }
-	   for (i=0;i<bytes_read;i++) {
-              if( j%16== 0 )
-                 printf( "\n    %08x: ",j);
-              printf("%02x ",buf[i]);
-              j++;
-           }
-           printf(" rr=%d",(bytes_read+(*rr)));
-	   printf("\n\n");
-           */
-           printf( "\n-----------------------------------------------------------" );
-           printf( "\nREAD:");
-           //Start byte
-           printf("\n7e "); j++;
-           //Size and checkbit
-           printf("%02x ",header[1]);
-           printf("                      size:              %d", header[1] );
-           printf("\n   " );
-           printf("%02x ",header[2]);
-           printf("\n   " );
-           printf("%02x ",header[3]);
-           printf("                      checkbit:          %d", header[3] );
-           printf("\n   " );
-           //Source Address
-           for( i=0; i<bytes_read; i++ ) {
-              if( i > 5 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("       source:            %02x:%02x:%02x:%02x:%02x:%02x", buf[5], buf[4], buf[3], buf[2], buf[1], buf[0] );
-           printf("\n   " );
-           //Destination Address
-           for( i=6; i<bytes_read; i++ ) {
-              if( i > 11 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("       destination:       %02x:%02x:%02x:%02x:%02x:%02x", buf[11], buf[10], buf[9], buf[8], buf[7], buf[6] );
-           printf("\n   " );
-           //Destination Address
-           for( i=12; i<bytes_read; i++ ) {
-              if( i > 13 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("                   control:           %02x%02x", buf[13], buf[12] );
-           readRecord->Control[0]=buf[12];
-           readRecord->Control[1]=buf[13];
-           
-           last_decoded=14;
-           if( memcmp( buf+14, "\x7e\xff\x03\x60\x65", 5 ) == 0 ){
-               printf("\n");
-               for( i=14; i<bytes_read; i++ ) {
-                   if( i > 18 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("             SMA Data2+ header: %02x:%02x:%02x:%02x:%02x", buf[18], buf[17], buf[16], buf[15], buf[14] );
-               printf("\n   " );
-               for( i=19; i<bytes_read; i++ ) {
-                   if( i > 19 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                      data packet size:  %02d", buf[19] );
-               printf("\n   " );
-               for( i=20; i<bytes_read; i++ ) {
-                   if( i > 20 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                      control:           %02x", buf[20] );
-               printf("\n   " );
-               for( i=21; i<bytes_read; i++ ) {
-                   if( i > 26 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("       source:            %02x %02x:%02x:%02x:%02x:%02x", buf[21], buf[26], buf[25], buf[24], buf[23], buf[22] );
-               printf("\n   " );
-               for( i=27; i<bytes_read; i++ ) {
-                   if( i > 28 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                   read status:       %02x %02x", buf[28], buf[27] );
-               printf("\n   " );
-               for( i=29; i<bytes_read; i++ ) {
-                   if( i > 30 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               readRecord->Status[0]=buf[28];
-               readRecord->Status[1]=buf[27];
-               printf("                   count up:          %02d %02x:%02x", buf[29]+buf[30]*256, buf[30], buf[29] );
-               printf("\n   " );
-               for( i=31; i<bytes_read; i++ ) {
-                   if( i > 32 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                   count down:        %02d %02x:%02x", buf[31]+buf[32]*256, buf[32], buf[31] );
-               printf("\n   " );
-               last_decoded=33;
-           }
-           printf("\n   " );
-           j=0;
-	   for (i=last_decoded;i<bytes_read;i++) {
-              if( j%16== 0 )
-                 printf( "\n   %08x: ",j);
-              printf("%02x ",buf[i]);
-              j++;
-           }
-           printf(" rr=%d",(bytes_read+3));
-	   printf("\n\n");
-        }
-           
-
- 
-    }	
-    (*rr)=0;
-    memset(received,0,1024);
-    return 0;
-}
-int
-read_bluetooth( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, int *s, int *rr, unsigned char *received, int cc, unsigned char *last_sent, int *terminated )
-{
-    int bytes_read,i,j, last_decoded;
-    unsigned char buf[1024]; /*read buffer*/
-    unsigned char header[4]; /*read buffer*/
-    unsigned char checkbit;
+    unsigned char header[3]; /*read buffer*/
     struct timeval tv;
     fd_set readfds;
 
@@ -653,12 +464,8 @@ read_bluetooth( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, i
     FD_ZERO(&readfds);
     FD_SET((*s), &readfds);
 				
-    if( select((*s)+1, &readfds, NULL, NULL, &tv) <  0) {
-        printf( "select error has occurred" ); getchar();
-    }
+    select((*s)+1, &readfds, NULL, NULL, &tv);
 				
-    if( flag->verbose==1) printf("Reading bluetooth packett\n");
-    if( flag->verbose==1) printf("socket=%d\n", (*s));
     (*terminated) = 0; // Tag to tell if string has 7e termination
     // first read the header to get the record length
     if (FD_ISSET((*s), &readfds)){	// did we receive anything within 5 seconds
@@ -666,13 +473,13 @@ read_bluetooth( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, i
 	(*rr) = 0;
         for( i=0; i<sizeof(header); i++ ) {
             received[(*rr)] = header[i];
-	    if (flag->debug == 2) printf("%02x ", received[i]);
+	    if (debug == 2) printf("%02x ", received[i]);
             (*rr)++;
         }
     }
     else
     {
-       if( flag->verbose==1) printf("Timeout reading bluetooth socket\n");
+       if( verbose==1) printf("Timeout reading bluetooth socket\n");
        (*rr) = 0;
        memset(received,0,1024);
        return -1;
@@ -682,126 +489,34 @@ read_bluetooth( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, i
     }
     else
     {
-       if( flag->verbose==1) printf("Timeout reading bluetooth socket\n");
+       if( verbose==1) printf("Timeout reading bluetooth socket\n");
        (*rr) = 0;
        memset(received,0,1024);
        return -1;
     }
-    readRecord->Status[0]=0;
-    readRecord->Status[1]=0;
     if ( bytes_read > 0){
-	if (flag->debug == 1){ 
-           printf( "\n-----------------------------------------------------------" );
-           printf( "\nREAD:");
-           //Start byte
-           printf("\n7e "); j++;
-           //Size and checkbit
-           printf("%02x ",header[1]);
-           printf("                      size:              %d", header[1] );
-           printf("\n   " );
-           printf("%02x ",header[2]);
-           printf("\n   " );
-           printf("%02x ",header[3]);
-           printf("                      checkbit:          %d", header[3] );
-           printf("\n   " );
-           //Source Address
-           for( i=0; i<bytes_read; i++ ) {
-              if( i > 5 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("       source:            %02x:%02x:%02x:%02x:%02x:%02x", buf[5], buf[4], buf[3], buf[2], buf[1], buf[0] );
-           printf("\n   " );
-           //Destination Address
-           for( i=6; i<bytes_read; i++ ) {
-              if( i > 11 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("       destination:       %02x:%02x:%02x:%02x:%02x:%02x", buf[11], buf[10], buf[9], buf[8], buf[7], buf[6] );
-           printf("\n   " );
-           //Destination Address
-           for( i=12; i<bytes_read; i++ ) {
-              if( i > 13 ) break;
-              printf("%02x ",buf[i]);
-           }
-           printf("                   control:           %02x%02x", buf[13], buf[12] );
-           readRecord->Control[0]=buf[12];
-           readRecord->Control[1]=buf[13];
-           
-           last_decoded=14;
-           if( memcmp( buf+14, "\x7e\xff\x03\x60\x65", 5 ) == 0 ){
-               printf("\n");
-               for( i=14; i<bytes_read; i++ ) {
-                   if( i > 18 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("             SMA Data2+ header: %02x:%02x:%02x:%02x:%02x", buf[18], buf[17], buf[16], buf[15], buf[14] );
-               printf("\n   " );
-               for( i=19; i<bytes_read; i++ ) {
-                   if( i > 19 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                      data packet size:  %02d", buf[19] );
-               printf("\n   " );
-               for( i=20; i<bytes_read; i++ ) {
-                   if( i > 20 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                      control:           %02x", buf[20] );
-               printf("\n   " );
-               for( i=21; i<bytes_read; i++ ) {
-                   if( i > 26 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("       source:            %02x %02x:%02x:%02x:%02x:%02x", buf[21], buf[26], buf[25], buf[24], buf[23], buf[22] );
-               printf("\n   " );
-               for( i=27; i<bytes_read; i++ ) {
-                   if( i > 28 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                   read status:       %02x %02x", buf[28], buf[27] );
-               printf("\n   " );
-               for( i=29; i<bytes_read; i++ ) {
-                   if( i > 30 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               readRecord->Status[0]=buf[28];
-               readRecord->Status[1]=buf[27];
-               printf("                   count up:          %02d %02x:%02x", buf[29]+buf[30]*256, buf[30], buf[29] );
-               printf("\n   " );
-               for( i=31; i<bytes_read; i++ ) {
-                   if( i > 32 ) break;
-                   printf("%02x ",buf[i]);
-               }
-               printf("                   count down:        %02d %02x:%02x", buf[31]+buf[32]*256, buf[32], buf[31] );
-               printf("\n   " );
-               last_decoded=33;
-           }
-           printf("\n   " );
-           j=0;
-	   for (i=last_decoded;i<bytes_read;i++) {
+        if (debug == 1) printf("\nReceiving\n");
+	if (debug == 1){ 
+           printf( "    %08x: .. .. .. .. .. .. .. .. .. .. .. .. ", 0 );
+           j=12;
+           for( i=0; i<sizeof(header); i++ ) {
               if( j%16== 0 )
-                 printf( "\n   %08x: ",j);
+                 printf( "\n    %08x: ",j);
+              printf("%02x ",header[i]);
+              j++;
+           }
+	   for (i=0;i<bytes_read;i++) {
+              if( j%16== 0 )
+                 printf( "\n    %08x: ",j);
               printf("%02x ",buf[i]);
               j++;
            }
-           printf(" rr=%d",(bytes_read+3));
+           printf(" rr=%d",(bytes_read+(*rr)));
 	   printf("\n\n");
         }
-           
-
- 
         if ((cc==bytes_read)&&(memcmp(received,last_sent,cc) == 0)){
            printf( "ERROR received what we sent!" ); getchar();
            //Need to do something
-        }
-        // Check check bit
-        checkbit=header[0]^header[1]^header[2];
-        if( checkbit != header[3] )
-        {
-            printf("\nCheckbit Error! %02x!=%02x\n",  header[0]^header[1]^header[2], header[3]);
-            (*rr) = 0;
-            memset(received,0,1024);
-            return -1;
         }
         if( buf[ bytes_read-1 ] == 0x7e )
            (*terminated) = 1;
@@ -828,15 +543,15 @@ read_bluetooth( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, i
 	    else { 
                received[(*rr)] = buf[i];
             }
-	    if (flag->debug == 2) printf("%02x ", received[(*rr)]);
+	    if (debug == 2) printf("%02x ", received[(*rr)]);
 	    (*rr)++;
 	}
-        fix_length_received( flag, received, rr );
-	if (flag->debug == 2) {
+        fix_length_received( received, rr );
+	if (debug == 2) {
 	    printf("\n");
             for( i=0;i<(*rr); i++ ) printf("%02x ", received[(i)]);
         }
-	if (flag->debug == 1) printf("\n\n");
+	if (debug == 1) printf("\n\n");
     }	
     return 0;
 }
@@ -852,7 +567,7 @@ int select_str(char *s)
     return -1;
 }
 
-unsigned char *  get_timezone_in_seconds( FlagType * flag, unsigned char *tzhex )
+unsigned char *  get_timezone_in_seconds( unsigned char *tzhex )
 {
    time_t curtime;
    struct tm *loctime;
@@ -875,28 +590,28 @@ unsigned char *  get_timezone_in_seconds( FlagType * flag, unsigned char *tzhex 
    utctime = gmtime(&curtime);
    
 
-   if( flag->debug == 1 ) printf( "utc=%04d-%02d-%02d %02d:%02d local=%04d-%02d-%02d %02d:%02d diff %d hours\n", utctime->tm_year+1900, utctime->tm_mon+1,utctime->tm_mday,utctime->tm_hour,utctime->tm_min, year, month, day, hour, minute, hour-utctime->tm_hour );
-   localOffset=(hour-utctime->tm_hour)+(float)(minute-utctime->tm_min)/60;
-   if( flag->debug == 1 ) printf( "localOffset=%f\n", localOffset );
+   if( debug == 1 ) printf( "utc=%04d-%02d-%02d %02d:%02d local=%04d-%02d-%02d %02d:%02d diff %d hours\n", utctime->tm_year+1900, utctime->tm_mon+1,utctime->tm_mday,utctime->tm_hour,utctime->tm_min, year, month, day, hour, minute, hour-utctime->tm_hour );
+   localOffset=(hour-utctime->tm_hour)+(minute-utctime->tm_min)/60;
+   if( debug == 1 ) printf( "localOffset=%f\n", localOffset );
    if(( year > utctime->tm_year+1900 )||( month > utctime->tm_mon+1 )||( day > utctime->tm_mday ))
       localOffset+=24;
    if(( year < utctime->tm_year+1900 )||( month < utctime->tm_mon+1 )||( day < utctime->tm_mday ))
       localOffset-=24;
-   if( flag->debug == 1 ) printf( "localOffset=%f isdst=%d\n", localOffset, isdst );
+   if( debug == 1 ) printf( "localOffset=%f isdst=%d\n", localOffset, isdst );
    if( isdst > 0 ) 
        localOffset=localOffset-1;
    tzsecs = (localOffset) * 3600 + 1;
    if( tzsecs < 0 )
        tzsecs=65536+tzsecs;
-   if( flag->debug == 1 ) printf( "tzsecs=%x %d\n", tzsecs, tzsecs );
+   if( debug == 1 ) printf( "tzsecs=%x %d\n", tzsecs, tzsecs );
    tzhex[1] = tzsecs/256;
    tzhex[0] = tzsecs -(tzsecs/256)*256;
-   if( flag->debug == 1 ) printf( "tzsecs=%02x %02x\n", tzhex[1], tzhex[0] );
+   if( debug == 1 ) printf( "tzsecs=%02x %02x\n", tzhex[1], tzhex[0] );
 
    return tzhex;
 }
 
-int auto_set_dates( ConfType * conf, FlagType * flag )
+int auto_set_dates( ConfType * conf, int * daterange, int mysql, char * datefrom, char * dateto )
 /*  If there are no dates set - get last updated date and go from there to NOW */
 {
     MYSQL_ROW 	row;
@@ -905,22 +620,26 @@ int auto_set_dates( ConfType * conf, FlagType * flag )
     int 	day,month,year,hour,minute,second;
     struct tm 	*loctime;
 
-    if( flag->mysql == 1 )
+    if( mysql == 1 )
     {
         OpenMySqlDatabase( conf->MySqlHost, conf->MySqlUser, conf->MySqlPwd, conf->MySqlDatabase);
+		// Gor - Remove illegal values first!
+        sprintf(SQLQUERY,"DELETE FROM DayData WHERE CurrentPower < 0 or ETotalToday = 9999999.999" );
+        if (debug == 1) printf("%s\n",SQLQUERY);
+        DoQuery(SQLQUERY);		
         //Get last updated value
-        sprintf(SQLQUERY,"SELECT DATE_FORMAT( DateTime, \"%%Y-%%m-%%d %%H:%%i:%%S\" ) FROM DayData WHERE 1 ORDER BY DateTime DESC LIMIT 1" );
-        if (flag->debug == 1) printf("%s\n",SQLQUERY);
+        sprintf(SQLQUERY,"SELECT DATE_FORMAT( DateTime, \"%%Y-%%m-%%d %%H:%%i:%%S\" ) FROM DayData ORDER BY DateTime DESC LIMIT 1" );
+        if (debug == 1) printf("%s\n",SQLQUERY);
         DoQuery(SQLQUERY);
         if ((row = mysql_fetch_row(res)))  //if there is a result, update the row
         {
-           strcpy( conf->datefrom, row[0] );
+           strcpy( datefrom, row[0] );
         }
         mysql_free_result( res );
         mysql_close(conn);
     }
-    if( strlen( conf->datefrom ) == 0 )
-        strcpy( conf->datefrom, "2000-01-01 00:00:00" );
+    if( strlen( datefrom ) == 0 )
+        strcpy( datefrom, "2000-01-01 00:00:00" );
     
     curtime = time(NULL);  //get time in seconds since epoch (1/1/1970)	
     loctime = localtime(&curtime);
@@ -930,13 +649,13 @@ int auto_set_dates( ConfType * conf, FlagType * flag )
     hour = loctime->tm_hour;
     minute = loctime->tm_min; 
     second = loctime->tm_sec; 
-    sprintf( conf->dateto, "%04d-%02d-%02d %02d:%02d:00", year, month, day, hour, minute );
-    flag->daterange=1;
-    if( flag->verbose == 1 ) printf( "Auto set dates from %s to %s\n", conf->datefrom, conf->dateto );
+    sprintf( dateto, "%04d-%02d-%02d %02d:%02d:00", year, month, day, hour, minute );
+    (*daterange)=1;
+    if( verbose == 1 ) printf( "Auto set dates from %s to %s\n", datefrom, dateto );
     return 1;
 }
 
-int is_light( ConfType * conf, FlagType * flag )
+int is_light( ConfType * conf )
 /*  Check if all data done and past sunset or before sunrise */
 {
     int	        light=1;
@@ -946,7 +665,7 @@ int is_light( ConfType * conf, FlagType * flag )
     OpenMySqlDatabase( conf->MySqlHost, conf->MySqlUser, conf->MySqlPwd, conf->MySqlDatabase);
     //Get Start of day value
     sprintf(SQLQUERY,"SELECT if(sunrise < NOW(),1,0) FROM Almanac WHERE date= DATE_FORMAT( NOW(), \"%%Y-%%m-%%d\" ) " );
-    if (flag->debug == 1) printf("%s\n",SQLQUERY);
+    if (debug == 1) printf("%s\n",SQLQUERY);
     DoQuery(SQLQUERY);
     if ((row = mysql_fetch_row(res)))  //if there is a result, update the row
     {
@@ -954,35 +673,93 @@ int is_light( ConfType * conf, FlagType * flag )
     }
     if( light ) {
        sprintf(SQLQUERY,"SELECT if( dd.datetime > al.sunset,1,0) FROM DayData as dd left join Almanac as al on al.date=DATE(dd.datetime) and al.date=DATE(NOW()) WHERE 1 ORDER BY dd.datetime DESC LIMIT 1" );
-       if (flag->debug == 1) printf("%s\n",SQLQUERY);
+       if (debug == 1) printf("%s\n",SQLQUERY);
        DoQuery(SQLQUERY);
        if ((row = mysql_fetch_row(res)))  //if there is a result, update the row
        {
           if( atoi( (char *)row[0] ) == 1 ) light=0;
        }
     }
-    if (flag->debug == 1) printf("Before close\n",SQLQUERY);
+    if (debug == 1) printf("Before close\n",SQLQUERY);
     
     mysql_close(conn);
     return light;
 }
 
 //Set a value depending on inverter
-void  SetInverterType( ConfType * conf, UnitType ** unit )  
+void  SetInverterType( ConfType * conf )  
 {
-    srand(time(NULL));
-    unit[0]->SUSyID[0] = 0xFF;
-    unit[0]->SUSyID[1] = 0xFF;
-    conf->MySUSyID[0] = rand()%254;
-    conf->MySUSyID[1] = rand()%254;
-    conf->MySerial[0] = rand()%254;
-    conf->MySerial[1] = rand()%254;
-    conf->MySerial[2] = rand()%254;
-    conf->MySerial[3] = rand()%254;
+    if( strcmp(conf->Inverter, "1700TL") == 0 ) {
+        conf->InverterCode[0] = 0x12;
+        conf->InverterCode[1] = 0x1a;
+        conf->InverterCode[2] = 0xd9;
+        conf->InverterCode[3] = 0x38;
+        conf->ArchiveCode    = 0x63;
+    }
+    if( strcmp(conf->Inverter, "2100TL") == 0 ) {
+        conf->InverterCode[0] = 0x17;
+        conf->InverterCode[1] = 0x97;
+        conf->InverterCode[2] = 0x51;
+        conf->InverterCode[3] = 0x38;
+        conf->ArchiveCode    = 0x63;
+    }
+    if( strcmp(conf->Inverter, "3000TL") == 0 ) {
+        conf->InverterCode[0] = 0x12;
+        conf->InverterCode[1] = 0x1a;
+        conf->InverterCode[2] = 0xd9;
+        conf->InverterCode[3] = 0x38;
+        conf->InverterCode[0] = 0x32;
+        conf->InverterCode[1] = 0x42;
+        conf->InverterCode[2] = 0x85;
+        conf->InverterCode[3] = 0x38;
+        conf->ArchiveCode    = 0x71;
+    }
+    if( strcmp(conf->Inverter, "3000TLHF") == 0 ) {
+        conf->InverterCode[0] = 0x1b;
+        conf->InverterCode[1] = 0xb1;
+        conf->InverterCode[2] = 0xa6;
+        conf->InverterCode[3] = 0x38;
+        conf->ArchiveCode    = 0x83;
+    }
+    if( strcmp(conf->Inverter, "4000TL") == 0 ) {
+        conf->InverterCode[0] = 0x78;
+        conf->InverterCode[1] = 0x21;
+        conf->InverterCode[2] = 0xbf;
+        conf->InverterCode[3] = 0x3a;
+        conf->ArchiveCode    = 0x4e;
+    }
+    if( strcmp(conf->Inverter, "5000TL") == 0 ) {
+        conf->InverterCode[0] = 0x3f;
+        conf->InverterCode[1] = 0x10;
+        conf->InverterCode[2] = 0xfb;
+        conf->InverterCode[3] = 0x39;
+        conf->ArchiveCode     = 0x4e;
+    }
+    if( strcmp(conf->Inverter, "7000") == 0 ) {
+        conf->InverterCode[0] = 0xcf;
+        conf->InverterCode[1] = 0x84;
+        conf->InverterCode[2] = 0x84;
+        conf->InverterCode[3] = 0x3a;
+        conf->ArchiveCode     = 0x63;
+    }
+    if( strcmp(conf->Inverter, "10000TL") == 0 ) {
+        conf->InverterCode[0] = 0x69;
+        conf->InverterCode[1] = 0x45;
+        conf->InverterCode[2] = 0x32;
+        conf->InverterCode[3] = 0x39;
+        conf->ArchiveCode     = 0x80;
+    }
+    if( strcmp(conf->Inverter, "XXXXTL") == 0 ) {
+        conf->InverterCode[0] = 0x99;
+        conf->InverterCode[1] = 0x35;
+        conf->InverterCode[2] = 0x40;
+        conf->InverterCode[3] = 0x36;
+        conf->ArchiveCode     = 0x4e;
+    }
 }
 
 //Convert a recieved string to a value
-long ConvertStreamtoLong( unsigned char * stream, int length, unsigned long long  * value )
+long ConvertStreamtoLong( unsigned char * stream, int length, long unsigned int * value )
 {
    int	i, nullvalue;
    
@@ -1019,56 +796,21 @@ float ConvertStreamtoFloat( unsigned char * stream, int length, float * value )
    return (*value);
 }
 
-//Convert a recieved string to a value
-char * ConvertStreamtoString( unsigned char * stream, int length )
-{
-   int	i, j=0, nullvalue;
-   char * value;
-   
-   nullvalue = 1;
-
-   value = malloc( sizeof(char)*10+1 );
-   for( i=0; i < length; i++ ) 
-   {
-      if( i%10 > j ) {
-            j++;
-	    value = realloc( value, sizeof(char)*10*j+1 );
-      }
-      if( stream[i] != 0xff ) //check if all ffs which is a null value 
-        nullvalue = 0;
-      if( stream[i] != 0 ) {
-         value[i] = stream[i];
-      }
-   }
-   if( nullvalue == 1 )
-      (*value) = 0; //Asigning null to 0 at this stage unless it breaks something
-   else
-      value[i]= 0; //string null termination
-   return (char *)value;
-}
 //read return value data from init file
 ReturnType * 
-InitReturnKeys( ConfType * conf )
+InitReturnKeys( ConfType * conf, ReturnType * returnkeylist, int * num_return_keys )
 {
    FILE		*fp;
    char		line[400];
    ReturnType   tmp;
-   ReturnType   *returnkeylist;
-   int		num_return_keys=0;
    int		i, j, reading, data_follows;
 
    data_follows = 0;
 
    fp=fopen(conf->File,"r");
-   if( fp == NULL ) {
-       printf( "\nCouldn't open file %s", conf->File );
-       printf( "\nerror=%s\n", strerror( errno ));
-       exit(1);
-   }
-   else {
 
-      while (!feof(fp)){	
-         if (fgets(line,400,fp) != NULL){				//read line from smatool.conf
+   while (!feof(fp)){	
+	if (fgets(line,400,fp) != NULL){				//read line from smatool.conf
             if( line[0] != '#' ) 
             {
                 if( strncmp( line, ":unit conversions", 17 ) == 0 )
@@ -1081,44 +823,44 @@ InitReturnKeys( ConfType * conf )
                     strcpy( tmp.description, "" ); //Null out value
                     strcpy( tmp.units, "" ); //Null out value
                     tmp.divisor=0;
-                    tmp.decimal=0;
-                    tmp.datalength=0;
-                    tmp.recordgap=0;
-                    tmp.persistent=1;
                     reading=0;
-                    if( sscanf( line, "%x %x \"%[^\"]\" \"%[^\"]\" %d %d %d %d", &tmp.key1, &tmp.key2, tmp.description, tmp.units, &tmp.decimal, &tmp.recordgap, &tmp.datalength, &tmp.persistent ) == 8 ) {
+                    if( sscanf( line, "%x %x", &tmp.key1, &tmp.key2  ) == 2 ) {
+                        j=0;
+                        for( i=6; line[i]!='\0'; i++ ) {
+                            if(( line[i] == '"' )&&(reading==1)) {
+                                tmp.description[j]='\0';
+                                break;
+                            }
+                            if( reading == 1 )
+                            {
+                                tmp.description[j] = line[i];
+                                j++;
+                            }
+                             
+                            if(( line[i] == '"' )&&(reading==0))
+                                reading = 1;
+                        }
+                        if( sscanf( line+i+1, "%s %f", tmp.units, &tmp.divisor ) == 2 ) {
                               
-                        if( (num_return_keys) == 0 )
-                            returnkeylist=(ReturnType *)malloc(sizeof(ReturnType));
-                        else
-                            returnkeylist=(ReturnType *)realloc(returnkeylist,sizeof(ReturnType)*((num_return_keys)+1));
-                        (returnkeylist+(num_return_keys))->key1=tmp.key1;
-                        (returnkeylist+(num_return_keys))->key2=tmp.key2;
-                        strcpy( (returnkeylist+(num_return_keys))->description, tmp.description );
-                        strcpy( (returnkeylist+(num_return_keys))->units, tmp.units );
-                        (returnkeylist+(num_return_keys))->decimal = tmp.decimal;
-                        (returnkeylist+(num_return_keys))->divisor = (float)pow( 10, tmp.decimal );
-                        (returnkeylist+(num_return_keys))->datalength = tmp.datalength;
-                        (returnkeylist+(num_return_keys))->recordgap = tmp.recordgap;
-                        (returnkeylist+(num_return_keys))->persistent = tmp.persistent;
-                        (num_return_keys)++;
-                    }
-                    else
-                    {
-                        if( line[0] != ':' )
-                        {
-                             printf( "\nWarning Data Scan Failure\n %s\n", line ); getchar();
+                            if( (*num_return_keys) == 0 )
+                                returnkeylist=(ReturnType *)malloc(sizeof(ReturnType));
+                            else
+                                returnkeylist=(ReturnType *)realloc(returnkeylist,sizeof(ReturnType)*((*num_return_keys)+1));
+                            (returnkeylist+(*num_return_keys))->key1=tmp.key1;
+                            (returnkeylist+(*num_return_keys))->key2=tmp.key2;
+                            strcpy( (returnkeylist+(*num_return_keys))->description, tmp.description );
+                            strcpy( (returnkeylist+(*num_return_keys))->units, tmp.units );
+                            (returnkeylist+(*num_return_keys))->divisor = tmp.divisor;
+                            (*num_return_keys)++;
                         }
                     }
                 }
             }
-         }
-      }
-   fclose(fp);
-   }
-   conf->num_return_keys=num_return_keys;
-   conf->returnkeylist=returnkeylist;
-   return returnkeylist;
+        }
+    }
+    fclose(fp);
+   
+    return returnkeylist;
 }
 
 //Convert a recieved string to a value
@@ -1141,10 +883,9 @@ int ConvertStreamtoInt( unsigned char * stream, int length, int * value )
 }
 
 //Convert a recieved string to a value
-time_t ConvertStreamtoTime( unsigned char * stream, int length, time_t * value, int *day, int *month, int *year, int *hour, int *minute, int *second )
+time_t ConvertStreamtoTime( unsigned char * stream, int length, time_t * value )
 {
    int	i, nullvalue;
-   struct tm *loctime;
    
    (*value) = 0;
    nullvalue = 1;
@@ -1157,65 +898,54 @@ time_t ConvertStreamtoTime( unsigned char * stream, int length, time_t * value, 
    }
    if( nullvalue == 1 )
       (*value) = 0; //Asigning null to 0 at this stage unless it breaks something
-   else
-   {
-      //Get human readable dates
-      loctime = localtime(value);
-      (*day) = loctime->tm_mday;
-      (*month) = loctime->tm_mon +1;
-      (*year) = loctime->tm_year + 1900;
-      (*hour) = loctime->tm_hour;
-      (*minute) = loctime->tm_min; 
-      (*second) = loctime->tm_sec; 
-   }
    return (*value);
 }
 
 // Set switches to save lots of strcmps
-void  SetSwitches( ConfType *conf, FlagType *flag )  
+void  SetSwitches( ConfType *conf, char * datefrom, char * dateto, int *location, int *mysql, int *post, int *file, int *daterange, int *test )  
 {
     //Check if all location variables are set
     if(( conf->latitude_f <= 180 )&&( conf->longitude_f <= 180 ))
-        flag->location=1;
+        (*location)=1;
     else
-        flag->location=0;
+        (*location)=0;
     //Check if all Mysql variables are set
     if(( strlen(conf->MySqlUser) > 0 )
 	 &&( strlen(conf->MySqlPwd) > 0 )
 	 &&( strlen(conf->MySqlHost) > 0 )
 	 &&( strlen(conf->MySqlDatabase) > 0 )
-	 &&( flag->test==0 ))
-        flag->mysql=1;
+	 &&( (*test)==0 ))
+        (*mysql)=1;
     else
-        flag->mysql=0;
+        (*mysql)=0;
     //Check if all File variables are set
     if( strlen(conf->File) > 0 )
-        flag->file=1;
+        (*file)=1;
     else
-        flag->file=0;
+        (*file)=0;
     //Check if all PVOutput variables are set
     if(( strlen(conf->PVOutputURL) > 0 )
 	 &&( strlen(conf->PVOutputKey) > 0 )
 	 &&( strlen(conf->PVOutputSid) > 0 ))
-        flag->post=1;
+        (*post)=1;
     else
-        flag->post=0;
-    if(( strlen(conf->datefrom) > 0 )
-	 &&( strlen(conf->dateto) > 0 ))
-        flag->daterange=1;
+        (*post)=0;
+    if(( strlen(datefrom) > 0 )
+	 &&( strlen(dateto) > 0 ))
+        (*daterange)=1;
     else
-        flag->daterange=0;
+        (*daterange)=0;
 }
 
 unsigned char *
-ReadStream( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, int * s, unsigned char * stream, int * streamlen, unsigned char * datalist, int * datalen, unsigned char * last_sent, int cc, int * terminated, int * togo )
+ReadStream( ConfType * conf, int * s, unsigned char * stream, int * streamlen, unsigned char * datalist, int * datalen, unsigned char * last_sent, int cc, int * terminated, int * togo )
 {
    int	finished;
    int	finished_record;
    int  i, j=0;
 
    (*togo)=ConvertStreamtoInt( stream+43, 2, togo );
-   if( flag->debug==1 ) printf( "togo=%d\n", (*togo) );
+   if( debug==1 ) printf( "togo=%d\n", (*togo) );
    i=59; //Initial position of data stream
    (*datalen)=0;
    datalist=(unsigned char *)malloc(sizeof(char));
@@ -1240,18 +970,13 @@ ReadStream( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, int *
      finished_record = 0;
      if( (*terminated) == 0 )
      {
-         if( read_bluetooth( conf, flag, readRecord, s, streamlen, stream, cc, last_sent, terminated ) != 0 )
-         {
-             free( datalist );
-             datalist = NULL;
-         }
-             
-         if( j> 0 ) i=18;
+         read_bluetooth( conf, s, streamlen, stream, cc, last_sent, terminated );
+         i=18;
      }
      else
          finished = 1;
    }
-   if( flag->debug== 1 ) {
+   if( debug== 1 ) {
      printf( "len=%d data=", (*datalen) );
      for( i=0; i< (*datalen); i++ )
         printf( "%02x ", datalist[i] );
@@ -1261,14 +986,15 @@ ReadStream( ConfType * conf, FlagType * flag, ReadRecordType * readRecord, int *
 }
 
 /* Init Config to default values */
-void InitConfig( ConfType *conf )
+void InitConfig( ConfType *conf, char * datefrom, char * dateto )
 {
     strcpy( conf->Config,"./smatool.conf");
+    strcpy( conf->Setting,"./invcode.in");
+    strcpy( conf->Inverter, "" );  
     strcpy( conf->BTAddress, "" );  
     conf->bt_timeout = 30;  
     strcpy( conf->Password, "0000" );  
-    strcpy( conf->File, "sma.in" );  
-    strcpy( conf->Xml, "/usr/local/bin/smatool.xml" );  
+    strcpy( conf->File, "sma.in.new" );  
     conf->latitude_f = 999 ;  
     conf->longitude_f = 999 ;  
     strcpy( conf->MySqlHost, "localhost" );  
@@ -1278,26 +1004,17 @@ void InitConfig( ConfType *conf )
     strcpy( conf->PVOutputURL, "http://pvoutput.org/service/r2/addstatus.jsp" );  
     strcpy( conf->PVOutputKey, "" );  
     strcpy( conf->PVOutputSid, "" );  
-    strcpy( conf->datefrom, "" );  
-    strcpy( conf->dateto, "" );  
-}
-
-/* Init Flagsg to default values */
-void InitFlag( FlagType *flag )
-{
-    flag->debug=0;         /* debug flag */
-    flag->verbose=0;       /* verbose flag */
-    flag->daterange=0;     /* is system using a daterange */
-    flag->location=0;     /* is system using a daterange */
-    flag->test=0;     /* is system using a daterange */
-    flag->mysql=0;     /* is system using a daterange */
-    flag->file=0;     /* is system using a daterange */
-    flag->post=0;     /* is system using a daterange */
-    flag->repost=0;     /* is system using a daterange */
+    conf->InverterCode[0]=0;  
+    conf->InverterCode[1]=0;  
+    conf->InverterCode[2]=0;  
+    conf->InverterCode[3]=0;  
+    conf->ArchiveCode=0;  
+    strcpy( datefrom, "" );  
+    strcpy( dateto, "" );  
 }
 
 /* read Config from file */
-int GetConfig( ConfType *conf, FlagType * flag )
+int GetConfig( ConfType *conf )
 {
     FILE 	*fp;
     char	line[400];
@@ -1326,9 +1043,11 @@ int GetConfig( ConfType *conf, FlagType * flag )
             {
                 strcpy( value, "" ); //Null out value
                 sscanf( line, "%s %s", variable, value );
-                if( flag->debug == 1 ) printf( "variable=%s value=%s\n", variable, value );
+                if( debug == 1 ) printf( "variable=%s value=%s\n", variable, value );
                 if( value[0] != '\0' )
                 {
+                    if( strcmp( variable, "Inverter" ) == 0 )
+                       strcpy( conf->Inverter, value );  
                     if( strcmp( variable, "BTAddress" ) == 0 )
                        strcpy( conf->BTAddress, value );  
                     if( strcmp( variable, "BTTimeout" ) == 0 )
@@ -1349,8 +1068,8 @@ int GetConfig( ConfType *conf, FlagType * flag )
                        strcpy( conf->MySqlUser, value );  
                     if( strcmp( variable, "MySqlPwd" ) == 0 )
                        strcpy( conf->MySqlPwd, value );  
-                    //if( strcmp( variable, "PVOutputURL" ) == 0 )
-                     //  strcpy( conf->PVOutputURL, value );  
+                    if( strcmp( variable, "PVOutputURL" ) == 0 )
+                       strcpy( conf->PVOutputURL, value );  
                     if( strcmp( variable, "PVOutputKey" ) == 0 )
                        strcpy( conf->PVOutputKey, value );  
                     if( strcmp( variable, "PVOutputSid" ) == 0 )
@@ -1364,7 +1083,7 @@ int GetConfig( ConfType *conf, FlagType * flag )
 }
 
 /* read  Inverter Settings from file */
-int GetInverterSetting( ConfType *conf, FlagType * flag )
+int GetInverterSetting( ConfType *conf )
 {
     FILE 	*fp;
     char	line[400];
@@ -1394,10 +1113,9 @@ int GetInverterSetting( ConfType *conf, FlagType * flag )
             {
                 strcpy( value, "" ); //Null out value
                 sscanf( line, "%s %s", variable, value );
-                if( flag->debug == 1 ) printf( "variable=%s value=%s\n", variable, value );
+                if( debug == 1 ) printf( "variable=%s value=%s\n", variable, value );
                 if( value[0] != '\0' )
                 {
-                    /*
                     if( strcmp( variable, "Inverter" ) == 0 )
                     {
                        if( strcmp( value, conf->Inverter ) == 0 )
@@ -1417,101 +1135,22 @@ int GetInverterSetting( ConfType *conf, FlagType * flag )
                        sscanf( value, "%X", &conf->InverterCode[3] );
                     if(( strcmp( variable, "InvCode" ) == 0 )&& found_inverter )
                        sscanf( value, "%X", &conf->ArchiveCode );
-*/
                 }
             }
         }
     }
     fclose( fp );
-    return( 0 );
-}
-
-xmlDocPtr
-getdoc (char *docname) {
-	xmlDocPtr doc;
-	doc = xmlParseFile(docname);
-	
-	if (doc == NULL ) {
-		fprintf(stderr,"Document not parsed successfully. \n");
-		return NULL;
-	}
-
-	return doc;
-}
-
-xmlXPathObjectPtr
-getnodeset (xmlDocPtr doc, xmlChar *xpath){
-	
-	xmlXPathContextPtr context;
-	xmlXPathObjectPtr result;
-
-	context = xmlXPathNewContext(doc);
-	if (context == NULL) {
-		printf("Error in xmlXPathNewContext\n");
-		return NULL;
-	}
-	result = xmlXPathEvalExpression(xpath, context);
-	xmlXPathFreeContext(context);
-	if (result == NULL) {
-		printf("Error in xmlXPathEvalExpression\n");
-		return NULL;
-	}
-	if(xmlXPathNodeSetIsEmpty(result->nodesetval)){
-		xmlXPathFreeObject(result);
-                printf("No result\n");
-		return NULL;
-	}
-	return result;
-}
-
-int
-setup_xml_xpath( ConfType *conf, xmlChar * xpath, char * docname, int index )
-{
-    int len;
-
-    sprintf( xpath, "//Datamap/Map[@index='%d']", index );
-    sprintf( docname, "%s", "/usr/local/bin/smatool.xml" );
-    return (1);
-}
-
-char *
-return_xml_data( ConfType *conf, int index )
-{
-    xmlDocPtr doc;
-    xmlNodeSetPtr nodeset;
-    xmlNodePtr cur;
-    xmlXPathObjectPtr result;
-    xmlChar xpath[30];
-    char docname[60];
-    char *return_string = (char *)NULL;
-    int i;
-    xmlChar *keyword;
-		
-    setup_xml_xpath( conf, xpath, docname, index );
-    doc = getdoc(docname);
-    result = getnodeset (doc, xpath);
-    if (result) {
-	nodeset = result->nodesetval;
-	for (i=0; i < nodeset->nodeNr; i++) {
-            cur = nodeset->nodeTab[i]->xmlChildrenNode;
-            while (cur != NULL ) {
-		if( xmlStrEqual(cur->name, (const xmlChar *)"Value")) {
-      		    keyword = xmlNodeListGetString(doc, cur->xmlChildrenNode, 1);
-                    return_string=malloc(sizeof(char)*strlen(keyword)+1);
-                    strcpy( return_string, keyword );
-                    xmlFree(keyword);
-		}
-	    	cur = cur->next;
-            }
-	}
-	xmlXPathFreeObject (result);
+    if(( conf->InverterCode[0] == 0 ) ||
+       ( conf->InverterCode[1] == 0 ) ||
+       ( conf->InverterCode[2] == 0 ) ||
+       ( conf->InverterCode[3] == 0 ) ||
+       ( conf->ArchiveCode == 0 ))
+    {
+       printf( "\n Error ! not all codes set\n" );
+       fclose( fp );
+       return( -1 );
     }
-    else
-        printf( "\nfailed to getnodeset" );
-    xmlFreeDoc(doc);
-    xmlCleanupParser();
-
-    return (char *)return_string ;
+    return( 0 );
 }
 
 /* Print a help message */
@@ -1525,8 +1164,8 @@ void PrintHelp()
     printf( "\n" );
     printf( "Dates are no longer required - defaults to last update if using mysql\n" );
     printf( "or 2000 to now if not using mysql\n" );
-    printf( "  -from  --datefrom YYYY-MM-DD HH:MM:00    Date range from date\n" );
-    printf( "  -to  --dateto YYYY-MM-DD HH:MM:00        Date range to date\n" );
+    printf( "  -from  --datefrom YYYY-DD-MM HH:MM:00    Date range from date\n" );
+    printf( "  -to  --dateto YYYY-DD-MM HH:MM:00        Date range to date\n" );
     printf( "\n" );
     printf( "The following options are in config file but may be overridden\n" );
     printf( "  -i,  --inverter INVERTER_MODEL           inverter model\n" );
@@ -1556,37 +1195,43 @@ void PrintHelp()
 }
 
 /* Init Config to default values */
-int ReadCommandConfig( ConfType *conf, FlagType *flag, int argc, char **argv, int * no_dark, int * install, int * update )
+int ReadCommandConfig( ConfType *conf, int argc, char **argv, char * datefrom, char * dateto, int * verbose, int * debug, int * repost, int * test, int * install, int * update )
 {
     int	i;
 
     // these need validation checking at some stage TODO
     for (i=1;i<argc;i++)			//Read through passed arguments
     {
-	if ((strcmp(argv[i],"-v")==0)||(strcmp(argv[i],"--verbose")==0)) flag->verbose = 1;
-	else if ((strcmp(argv[i],"-d")==0)||(strcmp(argv[i],"--debug")==0)) flag->debug = 1;
+	if ((strcmp(argv[i],"-v")==0)||(strcmp(argv[i],"--verbose")==0)) (*verbose) = 1;
+	else if ((strcmp(argv[i],"-d")==0)||(strcmp(argv[i],"--debug")==0)) (*debug) = 1;
 	else if ((strcmp(argv[i],"-c")==0)||(strcmp(argv[i],"--config")==0)){
 	    i++;
 	    if(i<argc){
 		strcpy(conf->Config,argv[i]);
 	    }
 	}
-	else if (strcmp(argv[i],"--test")==0) flag->test=1;
+	else if (strcmp(argv[i],"--test")==0) (*test)=1;
 	else if ((strcmp(argv[i],"-from")==0)||(strcmp(argv[i],"--datefrom")==0)){
 	    i++;
 	    if(i<argc){
-		strcpy(conf->datefrom,argv[i]);
+		strcpy(datefrom,argv[i]);
 	    }
 	}
 	else if ((strcmp(argv[i],"-to")==0)||(strcmp(argv[i],"--dateto")==0)){
 	    i++;
 	    if(i<argc){
-		strcpy(conf->dateto,argv[i]);
+		strcpy(dateto,argv[i]);
 	    }
 	}
 	else if (strcmp(argv[i],"-repost")==0){
 	    i++;
-            flag->repost=1;
+            (*repost)=1;
+	}
+        else if ((strcmp(argv[i],"-i")==0)||(strcmp(argv[i],"--inverter")==0)){
+            i++;
+            if (i<argc){
+	        strcpy(conf->Inverter,argv[i]);
+            }
 	}
         else if ((strcmp(argv[i],"-a")==0)||(strcmp(argv[i],"--address")==0)){
             i++;
@@ -1612,8 +1257,6 @@ int ReadCommandConfig( ConfType *conf, FlagType *flag, int argc, char **argv, in
 	        strcpy(conf->File,argv[i]);
             }
 	}
-	else if ((strcmp(argv[i],"-n")==0)||(strcmp(argv[i],"--nodark")==0)) (*no_dark)=1;
-
 	else if ((strcmp(argv[i],"-lat")==0)||(strcmp(argv[i],"--latitude")==0)){
 	    i++;
 	    if(i<argc){
@@ -1709,175 +1352,943 @@ char * debugdate()
 
 int main(int argc, char **argv)
 {
-    FILE 		*fp;
-    unsigned char 	* last_sent;
-    ConfType 		conf;
-    FlagType 		flag;
-    int 		maximumUnits=1;
-    UnitType 		*unit;
-    ReadRecordType 	readRecord;
-    ReturnType 		*returnkeylist;
-    unsigned char 	received[1024];
-    int			i,s;
-    int 		install=0, update=0, already_read=0, no_dark=0;
-    int 		error=0;
-    int 		max_output;
-    char 		compurl[400];  //seg error on curl fix 2012.01.14
-    unsigned char 	tzhex[2] = { 0 };
-    time_t 		reporttime;
-    MYSQL_ROW 		row, row1;
-    char 		SQLQUERY[200];
-    int			archdatalen=0, livedatalen=0;
-    ArchDataType 	*archdatalist=NULL;
-    LiveDataType 	*livedatalist=NULL;
+	FILE *fp;
+        unsigned char * last_sent;
+        ConfType conf;
+        ReturnType *returnkeylist;
+        int num_return_keys=0;
+	struct sockaddr_rc addr = { 0 };
+	unsigned char received[1024];
+	unsigned char datarecord[1024];
+	unsigned char * data;
+	unsigned char send_count = 0x0;
+        int return_key;
+        int gap=1;
+        int datalen = 0;
+        int archdatalen=0;
+        int failedbluetooth=0;
+        int terminated=0;
+	int s,i,j,status,mysql=0,post=0,repost=0,test=0,file=0,daterange=0;
+        int install=0, update=0, already_read=0;
+        int location=0, error=0;
+	int ret,found,crc_at_end, finished=0;
+        int togo=0;
+        int  initstarted=0,setupstarted=0,rangedatastarted=0;
+        long returnpos;
+        int returnline;
+        char compurl[400];  //seg error on curl fix 2012.01.14
+	char datefrom[100];
+	char dateto[100];
+        int  pass_i;
+	char line[400];
+	unsigned char address[6] = { 0 };
+	unsigned char address2[6] = { 0 };
+	unsigned char timestr[25] = { 0 };
+	unsigned char serial[4] = { 0 };
+	unsigned char tzhex[2] = { 0 };
+	unsigned char timeset[4] = { 0x30,0xfe,0x7e,0x00 };
+        int  invcode;
+	char *lineread;
+	time_t curtime;
+	time_t reporttime;
+	time_t fromtime;
+	time_t totime;
+	time_t idate;
+	time_t prev_idate;
+	struct tm *loctime;
+	struct tm tm;
+	int day,month,year,hour,minute,second,datapoint;
+	char tt[10] = {48,48,48,48,48,48,48,48,48,48}; 
+	char ti[3];	
+	char chan[1];
+	float currentpower_total;
+        int   rr;
+	int linenum = 0;
+	float dtotal;
+	float gtotal;
+	float ptotal;
+	float strength;
+	MYSQL_ROW row, row1;
+	char SQLQUERY[200];
+   struct archdata_type
+   {
+      time_t date;
+      char   inverter[20];
+      long unsigned int serial;
+      float  accum_value;
+      float  current_value;
+   } *archdatalist;
 
     char sunrise_time[6],sunset_time[6];
    
     CURL *curl;
     CURLcode result;
 
-    unit=(UnitType *)malloc( sizeof(UnitType) * maximumUnits);
-    if( unit == NULL ) {
-        printf("Error allocating memory for line buffer.");
-        exit(1);
-    }
     memset(received,0,1024);
     last_sent = (unsigned  char *)malloc( sizeof( unsigned char ));
     /* get the report time - used in various places */
     reporttime = time(NULL);  //get time in seconds since epoch (1/1/1970)	
    
     // set config to defaults
-    InitConfig( &conf );
-    InitFlag( &flag );
+    InitConfig( &conf, datefrom, dateto );
     // read command arguments needed so can get config
-    if( ReadCommandConfig( &conf, &flag, argc, argv, &no_dark, &install, &update ) < 0 )
+    if( ReadCommandConfig( &conf, argc, argv, datefrom, dateto, &verbose, &debug, &repost, &test, &install, &update ) < 0 )
         exit(0);
     // read Config file
-    if( GetConfig( &conf, &flag ) < 0 )
+    if( GetConfig( &conf ) < 0 )
         exit(-1);
     // read command arguments  again - they overide config
-    if( ReadCommandConfig( &conf, &flag, argc, argv, &no_dark ,&install, &update ) < 0 )
+    if( ReadCommandConfig( &conf, argc, argv, datefrom, dateto, &verbose, &debug, &repost, &test, &install, &update ) < 0 )
         exit(0);
     // read Inverter Setting file
-    //if( GetInverterSetting( &conf ) < 0 )
-      //  exit(-1);
+    if( GetInverterSetting( &conf ) < 0 )
+        exit(-1);
     // set switches used through the program
-    SetSwitches( &conf, &flag );  
-    if(( install==1 )&&( flag.mysql==1 ))
+    SetSwitches( &conf, datefrom, dateto, &location, &mysql, &post, &file, &daterange, &test );  
+    if(( install==1 )&&( mysql==1 ))
     {
-        install_mysql_tables( &conf, &flag, SCHEMA );
+        install_mysql_tables( &conf, SCHEMA, debug );
         exit(0);
     }
-    if(( update==1 )&&( flag.mysql==1 ))
+    if(( update==1 )&&( mysql==1 ))
     {
-        update_mysql_tables( &conf, &flag );
+        update_mysql_tables( &conf, debug );
         exit(0);
     }
-    // Get Return Value lookup from file
-    returnkeylist = InitReturnKeys( &conf );
     // Set value for inverter type
-    
-    SetInverterType( &conf, &unit );
+    //SetInverterType( &conf );
+    // Get Return Value lookup from file
+    returnkeylist = InitReturnKeys( &conf, returnkeylist, &num_return_keys );
     // Get Local Timezone offset in seconds
-    get_timezone_in_seconds( &flag, tzhex );
+    get_timezone_in_seconds( tzhex );
     // Location based information to avoid quering Inverter in the dark
-    if((flag.location==1)&&(flag.mysql==1)) {
-        if( flag.debug == 1 ) printf( "Before todays Almanac\n" ); 
+    if((location==1)&&(mysql==1)) {
+        if( debug == 1 ) printf( "Before todays Almanac\n" ); 
         if( ! todays_almanac( &conf ) ) {
-           sprintf( sunrise_time, "%s", sunrise(&conf ));
-           sprintf( sunset_time, "%s", sunset(&conf ));
-           if( flag.verbose==1) printf( "sunrise=%s sunset=%s\n", sunrise_time, sunset_time );
+           sprintf( sunrise_time, "%s", sunrise(conf.latitude_f,conf.longitude_f ));
+           sprintf( sunset_time, "%s", sunset(conf.latitude_f, conf.longitude_f ));
+           if( verbose==1) printf( "sunrise=%s sunset=%s\n", sunrise_time, sunset_time );
            update_almanac(  &conf, sunrise_time, sunset_time );
         }
     }
-    if( flag.mysql==1 ) { 
-        if( flag.debug == 1 ) printf( "Before Check Schema\n" ); 
-       	if( check_schema( &conf, &flag,  SCHEMA ) != 1 )
+    if( mysql==1 ) 
+        if( debug == 1 ) printf( "Before Check Schema\n" ); 
+       	if( check_schema( &conf, SCHEMA, debug ) != 1 )
             exit(-1);
-        if(flag.daterange==0 ) { //auto set the dates
-            if( flag.debug == 1 ) printf( "auto_set_dates\n" ); 
-            auto_set_dates( &conf, &flag);
-        }
+    if(daterange==0 ) { //auto set the dates
+        if( debug == 1 ) printf( "auto_set_dates\n" ); 
+        auto_set_dates( &conf, &daterange, mysql, datefrom, dateto );
     }
     else
-        if( flag.verbose == 1 ) printf( "QUERY RANGE    from %s to %s\n", conf.datefrom, conf.dateto ); 
-    if(( flag.daterange==1 )&&((flag.location=0)||(flag.mysql==0)||no_dark==1||is_light( &conf, &flag )))
+        if( verbose == 1 ) printf( "QUERY RANGE    from %s to %s\n", datefrom, dateto ); 
+    if(( daterange==1 )&&((location=0)||(mysql==0)||is_light( &conf )))
     {
-	if (flag.debug ==1) printf("Address %s\n",conf.BTAddress);
-        //Connect to Inverter
-        if ((s = ConnectSocket( &conf, &flag )) < 0 )
-           exit( -1 );
+	if (debug ==1) printf("Address %s\n",conf.BTAddress);
 
-        if (flag.file ==1)
+        if (file ==1)
 	  fp=fopen(conf.File,"r");
         else
 	  fp=fopen("/etc/sma.in","r");
+   	for( i=1; i<20; i++ ){
+      	    // allocate a socket
+      	    s = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+
+      	    // set the connection parameters (who to connect to)
+      	    addr.rc_family = AF_BLUETOOTH;
+      	    addr.rc_channel = (uint8_t) 1;
+      	    str2ba( conf.BTAddress, &addr.rc_bdaddr );
+
+      	    // connect to server
+      	    if( debug==1 ) { printf( "datefrom=%s dateto=%s\n", datefrom, dateto ); }
+      	    status = connect(s, (struct sockaddr *)&addr, sizeof(addr));
+      	    if (status <0){
+                printf("Error connecting to %s\n",conf.BTAddress);
+                close( s );
+      	    }
+            else
+                break;
+        }
+   	if (status < 0 )
+   	{
+    	    printf("Bad Status\n");
+	    return( -1 );
+   	}
 
    	// convert address
-/*
-   	dest_address[5] = conv(strtok(conf.BTAddress,":"));
-   	dest_address[4] = conv(strtok(NULL,":"));
-   	dest_address[3] = conv(strtok(NULL,":"));
-   	dest_address[2] = conv(strtok(NULL,":"));
-   	dest_address[1] = conv(strtok(NULL,":"));
-   	dest_address[0] = conv(strtok(NULL,":"));
-*/
+   	address[5] = conv(strtok(conf.BTAddress,":"));
+   	address[4] = conv(strtok(NULL,":"));
+   	address[3] = conv(strtok(NULL,":"));
+   	address[2] = conv(strtok(NULL,":"));
+   	address[1] = conv(strtok(NULL,":"));
+   	address[0] = conv(strtok(NULL,":"));
+	
+   	while (!feof(fp)){	
+            start:
+	    if (fgets(line,400,fp) != NULL){				//read line from sma.in
+		linenum++;
+		lineread = strtok(line," ;");
+		if(!strcmp(lineread,"R")){		//See if line is something we need to receive
+		    if (debug	== 1) printf("[%d] %s Waiting for string\n",linenum, debugdate() );
+		    cc = 0;
+		    do{
+			lineread = strtok(NULL," ;");
+			switch(select_str(lineread)) {
+	
+			    case 0: // $END
+				//do nothing
+				break;			
 
-        OpenInverter( &conf, &flag, &unit,  &s, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "login", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen  );
-        InverterCommand( "typelabel", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "typelabel", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "startuptime", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getacvoltage", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getenergyproduction", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getspotdcpower", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getspotdcvoltage", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getspotacpower", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getgridfreq", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "maxACPower", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "maxACPowerTotal", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "ACPowerTotal", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "DeviceStatus", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "getrangedata", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
-        InverterCommand( "logoff", &conf, &flag, &unit, &s, fp, &archdatalist, &archdatalen, &livedatalist, &livedatalen );
+			    case 1: // $ADDR
+				for (i=0;i<6;i++){
+			  	    fl[cc] = address[i];
+				    cc++;
+				}
+			   	 break;	
+
+			    case 3: // $SER
+				for (i=0;i<4;i++){
+			  	    fl[cc] = serial[i];
+				    cc++;
+				}
+				break;	
+				
+			    case 7: // $ADD2
+				for (i=0;i<6;i++){
+				    fl[cc] = address2[i];
+				    cc++;
+				}
+				break;	
+
+			    case 8: // $CHAN
+				fl[cc] = chan[0];
+				cc++;
+				break;
+
+			    default :
+				fl[cc] = conv(lineread);
+				cc++;
+			}
+
+		    } 
+		    while (strcmp(lineread,"$END"));
+			if (debug == 1){ 
+				printf("[%d] %s waiting for: ", linenum, debugdate() );
+				for (i=0;i<cc;i++) printf("%02x ",fl[i]);
+			   printf("\n\n");
+			}
+			if (debug == 1) printf("[%d] %s Waiting for data on rfcomm\n", linenum, debugdate());
+			found = 0;
+			do {
+                            if( already_read == 0 )
+                                rr=0;
+                            if(( already_read == 0 )&&( read_bluetooth( &conf, &s, &rr, received, cc, last_sent, &terminated ) != 0 ))
+                            {
+                                already_read=0;
+                                fseek( fp, returnpos, 0 );
+                                linenum = returnline;
+                                found=0;
+                                if( archdatalen > 0 )
+                                   free( archdatalist );
+                                archdatalen=0;
+                                strcpy( lineread, "" );
+                                sleep(10);
+                                failedbluetooth++;
+                                if( failedbluetooth > 3 )
+                                    exit(-1);
+                                goto start;
+                            }
+                            else {
+                              already_read=0;
+			      if (debug == 1){ 
+                                printf( "[%d] %s looking for: ",linenum, debugdate());
+				for (i=0;i<cc;i++) printf("%02x ",fl[i]);
+                                printf( "\n" );
+                                printf( "[%d] %s received:    ",linenum, debugdate());
+				for (i=0;i<rr;i++) printf("%02x ",received[i]);
+			        printf("\n\n");
+			      }
+                           
+			      if (memcmp(fl+4,received+4,cc-4) == 0){
+				  found = 1;
+				  if (debug == 1) printf("[%d] %s Found string we are waiting for\n",linenum, debugdate()); 
+			      } else {
+				  if (debug == 1) printf("[%d] %s Did not find string\n", linenum,debugdate()); 
+			      }
+                            }
+			} while (found == 0);
+			if (debug == 2){ 
+				for (i=0;i<cc;i++) printf("%02x ",fl[i]);
+			   printf("\n\n");
+			}
+		}
+		if(!strcmp(lineread,"S")){		//See if line is something we need to send
+			if (debug	== 1) printf("[%d] %s Sending\n", linenum,debugdate());
+			cc = 0;
+			do{
+				lineread = strtok(NULL," ;");
+				switch(select_str(lineread)) {
+	
+				case 0: // $END
+				//do nothing
+				break;			
+
+				case 1: // $ADDR
+				for (i=0;i<6;i++){
+					fl[cc] = address[i];
+					cc++;
+				}
+				break;
+
+				case 3: // $SER
+				for (i=0;i<4;i++){
+					fl[cc] = serial[i];
+					cc++;
+				}
+				break;	
+				
+
+				case 7: // $ADD2
+				for (i=0;i<6;i++){
+					fl[cc] = address2[i];
+					cc++;
+				}
+				break;
+
+				case 2: // $TIME	
+				// get report time and convert
+				sprintf(tt,"%x",(int)reporttime); //convert to a hex in a string
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+				case 11: // $TMPLUS	
+				// get report time and convert
+				sprintf(tt,"%x",(int)reporttime+1); //convert to a hex in a string
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+
+				case 10: // $TMMINUS
+				// get report time and convert
+				sprintf(tt,"%x",(int)reporttime-1); //convert to a hex in a string
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+				case 4: //$crc
+				tryfcs16(fl+19, cc -19);
+                                add_escapes(fl,&cc);
+                                fix_length_send(fl,&cc);
+				break;
+
+				case 8: // $CHAN
+				fl[cc] = chan[0];
+				cc++;
+				break;
+
+				case 12: // $TIMESTRING
+				for (i=0;i<25;i++){
+					fl[cc] = timestr[i];
+					cc++;
+				}
+				break;
+
+				case 13: // $TIMEFROM1	
+				// get report time and convert
+                                if( daterange == 1 ) {
+                                    if( strptime( datefrom, "%Y-%m-%d %H:%M:%S", &tm) == 0 ) 
+                                    {
+                                        if( debug==1 ) printf( "datefrom %s\n", datefrom );
+                                        printf( "Time Coversion Error\n" );
+                                        error=1;
+                                        exit(-1);
+                                    }
+                                    tm.tm_isdst=-1;
+                                    fromtime=mktime(&tm);
+                                    if( fromtime == -1 ) {
+                                    // Error we need to do something about it
+                                        printf( "%03x",(int)fromtime ); getchar();
+                                        printf( "\n%03x", (int)fromtime ); getchar();
+                                        fromtime=0;
+                                        printf( "bad from" ); getchar();
+                                    }
+                                }
+                                else
+                                {
+                                  printf( "no from" ); getchar();
+                                  fromtime=0;
+                                }
+				sprintf(tt,"%03x",(int)fromtime-300); //convert to a hex in a string and start 5 mins before for dummy read.
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+				case 14: // $TIMETO1	
+                                if( daterange == 1 ) {
+                                    if( strptime( dateto, "%Y-%m-%d %H:%M:%S", &tm) == 0 ) 
+                                    {
+                                        if( debug==1 ) printf( "dateto %s\n", dateto );
+                                        printf( "Time Coversion Error\n" );
+                                        error=1;
+                                        exit(-1);
+                                    }
+                                    tm.tm_isdst=-1;
+                                    totime=mktime(&tm);
+                                    if( totime == -1 ) {
+                                    // Error we need to do something about it
+                                        printf( "%03x",(int)totime ); getchar();
+                                        printf( "\n%03x", (int)totime ); getchar();
+                                        totime=0;
+                                        printf( "bad to" ); getchar();
+                                    }
+                                }
+                                else
+                                  totime=0;
+				sprintf(tt,"%03x",(int)totime); //convert to a hex in a string
+				// get report time and convert
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+				case 15: // $TIMEFROM2	
+                                if( daterange == 1 ) {
+                                    strptime( datefrom, "%Y-%m-%d %H:%M:%S", &tm);
+                                    tm.tm_isdst=-1;
+                                    fromtime=mktime(&tm)-86400;
+                                    if( fromtime == -1 ) {
+                                    // Error we need to do something about it
+                                        printf( "%03x",(int)fromtime ); getchar();
+                                        printf( "\n%03x", (int)fromtime ); getchar();
+                                        fromtime=0;
+                                        printf( "bad from" ); getchar();
+                                    }
+                                }
+                                else
+                                {
+                                  printf( "no from" ); getchar();
+                                  fromtime=0;
+                                }
+				sprintf(tt,"%03x",(int)fromtime); //convert to a hex in a string
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+
+				case 16: // $TIMETO2	
+                                if( daterange == 1 ) {
+                                    strptime( dateto, "%Y-%m-%d %H:%M:%S", &tm);
+
+                                    tm.tm_isdst=-1;
+                                    totime=mktime(&tm)-86400;
+                                    if( totime == -1 ) {
+                                    // Error we need to do something about it
+                                        printf( "%03x",(int)totime ); getchar();
+                                        printf( "\n%03x", (int)totime ); getchar();
+                                        fromtime=0;
+                                        printf( "bad from" ); getchar();
+                                    }
+                                }
+                                else
+                                  totime=0;
+				sprintf(tt,"%03x",(int)totime); //convert to a hex in a string
+				for (i=7;i>0;i=i-2){ //change order and convert to integer
+					ti[1] = tt[i];
+					ti[0] = tt[i-1];	
+                                        ti[2] = '\0';
+					fl[cc] = conv(ti);
+					cc++;		
+				}
+				break;
+				
+				case 19: // $PASSWORD
+                              
+                                j=0;
+				for(i=0;i<12;i++){
+				    if( conf.Password[j] == '\0' )
+                                  	fl[cc] = 0x88;
+                                    else {
+                                        pass_i = conf.Password[j];
+                                        fl[cc] = (( pass_i+0x88 )%0xff);
+                                        j++;
+                                    }
+                                    cc++;
+				}
+				break;	
+
+				case 21: // $UNKNOWN
+				for (i=0;i<4;i++){
+			            fl[cc] = conf.InverterCode[i];
+				    cc++;
+				}
+                                break;
+
+				case 22: // $INVCODE
+			            fl[cc] = invcode;
+				    cc++;
+                                break;
+				case 23: // $ARCHCODE
+			            fl[cc] = conf.ArchiveCode;
+				    cc++;
+                                break;
+				case 25: // $CNT send counter
+                                    send_count++;
+			            fl[cc] = send_count;
+				    cc++;
+                                break;
+				case 26: // $TIMEZONE timezone in seconds, reverse endian
+			            fl[cc] = tzhex[0];
+			            fl[cc+1] = tzhex[1];
+				    cc+=2;
+                                break;
+				case 27: // $TIMESET unknown setting
+                                    for( i=0; i<4; i++ ) {
+			                fl[cc] = timeset[i];
+				        cc++;
+                                    }
+                                break;
+
+				default :
+				fl[cc] = conv(lineread);
+				cc++;
+				}
+
+			} while (strcmp(lineread,"$END"));
+			if (debug == 1){ 
+				printf( "[%d] %s sending:\n",linenum, debugdate());
+                                printf( "    %08x: .. .. .. .. .. .. .. .. .. .. .. .. ", 0 );
+                                j=12;
+				for (i=0;i<cc;i++) {
+                                   if( j%16== 0 )
+                                      printf( "\n    %08x: ",j);
+                                   printf("%02x ",fl[i]);
+                                   j++;
+                                }
+                           printf(" cc=%d",cc);
+			   printf("\n\n");
+			}
+                        last_sent = (unsigned  char *)realloc( last_sent, sizeof( unsigned char )*(cc));
+			memcpy(last_sent,fl,cc);
+			write(s,fl,cc);
+                        already_read=0;
+                        //check_send_error( &conf, &s, &rr, received, cc, last_sent, &terminated, &already_read ); 
+		}
+
+
+		if(!strcmp(lineread,"E")){		//See if line is something we need to extract
+			if (debug	== 1) printf("[%d] %s Extracting\n", linenum, debugdate());
+			cc = 0;
+			do{
+				lineread = strtok(NULL," ;");
+				//printf( "\nselect=%d", select_str(lineread)); 
+				switch(select_str(lineread)) {
+                              
+                                case 3: // Extract Serial of Inverter
+                               
+                                data = ReadStream( &conf, &s, received, &rr, data, &datalen, last_sent, cc, &terminated, &togo );
+                                /*
+                                printf( "1.len=%d data=", datalen );
+                                for( i=0; i< datalen; i++ )
+                                  printf( "%02x ", data[i] );
+                                printf( "\n" );
+                                */
+                                serial[3]=data[19];
+                                serial[2]=data[18];
+                                serial[1]=data[17];
+                                serial[0]=data[16];
+			        if (verbose	== 1) printf( "serial=%02x:%02x:%02x:%02x\n",serial[3]&0xff,serial[2]&0xff,serial[1]&0xff,serial[0]&0xff ); 
+                                free( data );
+                                break;
+                                
+				case 9: // extract Time from Inverter
+				idate = (received[66] * 16777216 ) + (received[65] *65536 )+ (received[64] * 256) + received[63];
+                                loctime = localtime(&idate);
+                                day = loctime->tm_mday;
+                                month = loctime->tm_mon +1;
+                                year = loctime->tm_year + 1900;
+                                hour = loctime->tm_hour;
+                                minute = loctime->tm_min; 
+                                second = loctime->tm_sec; 
+				printf("Date power = %d/%d/%4d %02d:%02d:%02d\n",day, month, year, hour, minute,second);
+				//currentpower = (received[72] * 256) + received[71];
+				//printf("Current power = %i Watt\n",currentpower);
+				break;
+				case 5: // extract current power $POW
+                                data = ReadStream( &conf, &s, received, &rr, data, &datalen, last_sent, cc, &terminated, &togo );
+                                if( (data+3)[0] == 0x08 )
+                                    gap = 40; 
+                                if( (data+3)[0] == 0x10 )
+                                    gap = 40; 
+                                if( (data+3)[0] == 0x40 )
+                                    gap = 28;
+                                if( (data+3)[0] == 0x00 )
+                                    gap = 28;
+                                for ( i = 0; i<datalen; i+=gap ) 
+                                {
+                                   idate=ConvertStreamtoTime( data+i+4, 4, &idate );
+                                   loctime = localtime(&idate);
+                                   day = loctime->tm_mday;
+                                   month = loctime->tm_mon +1;
+                                   year = loctime->tm_year + 1900;
+                                   hour = loctime->tm_hour;
+                                   minute = loctime->tm_min; 
+                                   second = loctime->tm_sec; 
+                                   ConvertStreamtoFloat( data+i+8, 3, &currentpower_total );
+                                   return_key=-1;
+                                   for( j=0; j<num_return_keys; j++ )
+                                   {
+                                      if(( (data+i+1)[0] == returnkeylist[j].key1 )&&((data+i+2)[0] == returnkeylist[j].key2)) {
+                                          return_key=j;
+                                          break;
+                                      }
+                                   }
+                                   if( return_key >= 0 )
+				       printf("%d-%02d-%02d %02d:%02d:%02d %-20s = %.0f %-20s\n", year, month, day, hour, minute, second, returnkeylist[return_key].description, currentpower_total/returnkeylist[return_key].divisor, returnkeylist[return_key].units );
+                                   else
+				       printf("%d-%02d-%02d %02d:%02d:%02d NO DATA for %02x %02x = %.0f NO UNITS\n", year, month, day, hour, minute, second, (data+i+1)[0], (data+i+1)[1], currentpower_total );
+                                }
+                                free( data );
+				break;
+
+				case 6: // extract total energy collected today
+                          
+				gtotal = (received[69] * 65536) + (received[68] * 256) + received[67];
+				gtotal = gtotal / 1000;
+            printf("G total so far = %.2f Kwh\n",gtotal);
+				dtotal = (received[84] * 256) + received[83];
+				dtotal = dtotal / 1000;
+            printf("E total today = %.2f Kwh\n",dtotal);
+            break;		
+
+				case 7: // extract 2nd address
+				memcpy(address2,received+26,6);
+				if (debug == 1) printf("address 2 \n");
+				break;
+				
+				case 8: // extract bluetooth channel
+				memcpy(chan,received+22,1);
+				if (debug == 1) printf("Bluetooth channel = %i\n",chan[0]);
+				break;
+
+				case 12: // extract time strings $TIMESTRING
+                                if(( received[60] == 0x6d )&&( received[61] == 0x23 ))
+                                {
+				    memcpy(timestr,received+63,24);
+				    if (debug == 1) printf("extracting timestring\n");
+                                    memcpy(timeset,received+79,4);
+                                    idate=ConvertStreamtoTime( received+63,4, &idate );
+                                    /* Allow delay for inverter to be slow */
+                                    if( reporttime > idate ) {
+                                       if( debug == 1 )
+                                           printf( "delay=%d\n", (int)(reporttime-idate) );
+                                       //sleep( reporttime - idate );
+                                       sleep(5);    //was sleeping for > 1min excessive
+                                    }
+                                }
+                                else
+                                {
+				    memcpy(timestr,received+63,24);
+				    if (debug == 1) printf("bad extracting timestring\n");
+                                    already_read=0;
+                                    fseek( fp, returnpos, 0 );
+                                    linenum = returnline;
+                                    found=0;
+                                    if( archdatalen > 0 )
+                                       free( archdatalist );
+                                    archdatalen=0;
+                                    strcpy( lineread, "" );
+                                    failedbluetooth++;
+                                    if( failedbluetooth > 60 )
+                                        exit(-1);
+                                    goto start;
+                                    //exit(-1);
+                                }
+                                
+				break;
+
+				case 17: // Test data
+                                data = ReadStream( &conf, &s, received, &rr, data, &datalen, last_sent, cc, &terminated, &togo );
+                                printf( "\n" );
+                          
+                                free( data );
+				break;
+				
+				case 18: // $ARCHIVEDATA1
+                                finished=0;
+                                ptotal=0;
+                                idate=0;
+                                printf( "\n" );
+                                while( finished != 1 ) {
+                                    data = ReadStream( &conf, &s, received, &rr, data, &datalen, last_sent, cc, &terminated, &togo );
+
+                                    j=0;
+                                    for( i=0; i<datalen; i++ )
+                                    {
+                                       datarecord[j]=data[i];
+                                       j++;
+                                       if( j > 11 ) {
+                                         if( idate > 0 ) prev_idate=idate;
+                                         else prev_idate=0;
+                                         idate=ConvertStreamtoTime( datarecord, 4, &idate );
+                                         if( prev_idate == 0 )
+                                            prev_idate = idate-300;
+
+                                         loctime = localtime(&idate);
+                                         day = loctime->tm_mday;
+                                         month = loctime->tm_mon +1;
+                                         year = loctime->tm_year + 1900;
+                                         hour = loctime->tm_hour;
+                                         minute = loctime->tm_min; 
+                                         second = loctime->tm_sec; 
+                                         ConvertStreamtoFloat( datarecord+4, 8, &gtotal );
+                                         if(archdatalen == 0 )
+                                            ptotal = gtotal;
+	                                    printf("\n%d/%d/%4d %02d:%02d:%02d  total=%.3f Kwh current=%.0f Watts togo=%d i=%d crc=%d", day, month, year, hour, minute,second, gtotal/1000, (gtotal-ptotal)*12, togo, i, crc_at_end);
+                                         if( idate != prev_idate+300 ) {
+                                            printf( "Date Error! prev=%d current=%d\n", (int)prev_idate, (int)idate );
+                                            // error=1;
+					    // break;
+                                         }
+                                         if( archdatalen == 0 )
+                                            archdatalist = (struct archdata_type *)malloc( sizeof( struct archdata_type ) );
+                                         else
+                                            archdatalist = (struct archdata_type *)realloc( archdatalist, sizeof( struct archdata_type )*(archdatalen+1));
+					 (archdatalist+archdatalen)->date=idate;
+                                         strcpy((archdatalist+archdatalen)->inverter,conf.Inverter);
+                                         ConvertStreamtoLong( serial, 4, &(archdatalist+archdatalen)->serial);
+                                         (archdatalist+archdatalen)->accum_value=gtotal/1000;
+                                         (archdatalist+archdatalen)->current_value=(gtotal-ptotal)*12;
+                                         archdatalen++;
+                                         ptotal=gtotal;
+                                         j=0; //get ready for another record
+                                      }
+                                   }
+                                   if( togo == 0 ) 
+                                      finished=1;
+                                   else
+                                      if( read_bluetooth( &conf, &s, &rr, received, cc, last_sent, &terminated ) != 0 )
+                                      {
+                                         fseek( fp, returnpos, 0 );
+                                         linenum = returnline;
+                                         found=0;
+                                         if( archdatalen > 0 )
+                                            free( archdatalist );
+                                         archdatalen=0;
+                                         strcpy( lineread, "" );
+                                         sleep(10);
+                                         failedbluetooth++;
+                                         if( failedbluetooth > 3 )
+                                           exit(-1);
+                                         goto start;
+                                      }
+                                }
+                                free( data );
+                                printf( "\n" );
+                          
+				break;
+				case 20: // SIGNAL signal strength
+                          
+				strength  = (received[22] * 100.0)/0xff;
+	                        if (verbose == 1) {
+                                    printf("bluetooth signal = %.0f%%\n",strength);
+                                }
+                                break;		
+				case 22: // extract time strings $INVCODE
+				invcode=received[22];
+				if (debug == 1) printf("extracting invcode=%02x\n", invcode);
+                                
+				break;
+				case 24: // Inverter data $INVERTERDATA
+                                data = ReadStream( &conf, &s, received, &rr, data, &datalen, last_sent, cc, &terminated, &togo );
+                                if( debug==1 ) printf( "data=%02x\n",(data+3)[0] );
+                                if( (data+3)[0] == 0x08 )
+                                    gap = 40; 
+                                if( (data+3)[0] == 0x10 )
+                                    gap = 40; 
+                                if( (data+3)[0] == 0x40 )
+                                    gap = 28;
+                                if( (data+3)[0] == 0x00 )
+                                    gap = 28;
+                                for ( i = 0; i<datalen; i+=gap ) 
+                                {
+                                   idate=ConvertStreamtoTime( data+i+4, 4, &idate );
+                                   loctime = localtime(&idate);
+                                   day = loctime->tm_mday;
+                                   month = loctime->tm_mon +1;
+                                   year = loctime->tm_year + 1900;
+                                   hour = loctime->tm_hour;
+                                   minute = loctime->tm_min; 
+                                   second = loctime->tm_sec; 
+                                   ConvertStreamtoFloat( data+i+8, 3, &currentpower_total );
+                                   return_key=-1;
+                                   for( j=0; j<num_return_keys; j++ )
+                                   {
+                                      if(( (data+i+1)[0] == returnkeylist[j].key1 )&&((data+i+2)[0] == returnkeylist[j].key2)) {
+                                          return_key=j;
+                                          break;
+                                      }
+                                   }
+                                   if( return_key >= 0 ) {
+                                       if( i==0 )
+				           printf("%d-%02d-%02d  %02d:%02d:%02d %s\n", year, month, day, hour, minute, second, (data+i+8) );
+				       printf("%d-%02d-%02d %02d:%02d:%02d %-20s = %.0f %-20s\n", year, month, day, hour, minute, second, returnkeylist[return_key].description, currentpower_total/returnkeylist[return_key].divisor, returnkeylist[return_key].units );
+                                   }
+                                   else
+				       printf("%d-%02d-%02d %02d:%02d:%02d NO DATA for %02x %02x = %.0f NO UNITS \n", year, month, day, hour, minute, second, (data+i+1)[0], (data+i+1)[0], currentpower_total );
+                                }
+                                free( data );
+				break;
+				}				
+                            }
+				
+			while (strcmp(lineread,"$END"));
+		} 
+		if(!strcmp(lineread,":init")){		//See if line is something we need to extract
+                   initstarted=1;
+                   returnpos=ftell(fp);
+		   returnline = linenum;
+                }
+		if(!strcmp(lineread,":setup")){		//See if line is something we need to extract
+                   setupstarted=1;
+                   returnpos=ftell(fp);
+		   returnline = linenum;
+                }
+		if(!strcmp(lineread,":startsetup")){		//See if line is something we need to extract
+                   sleep(1);
+                }
+		if(!strcmp(lineread,":setinverter1")){		//See if line is something we need to extract
+                   setupstarted=1;
+                   returnpos=ftell(fp);
+		   returnline = linenum;
+                }
+		if(!strcmp(lineread,":getrangedata")){		//See if line is something we need to extract
+                   rangedatastarted=1;
+                   returnpos=ftell(fp);
+		   returnline = linenum;
+                }
+	}
     }
 
-    if ((flag.post ==1)&&(flag.mysql==1)&&(error==0)){
+    if ((mysql ==1)&&(error==0)){
 	/* Connect to database */
         OpenMySqlDatabase( conf.MySqlHost, conf.MySqlUser, conf.MySqlPwd, conf.MySqlDatabase );
         for( i=1; i<archdatalen; i++ ) //Start at 1 as the first record is a dummy
         {
 	    sprintf(SQLQUERY,"INSERT INTO DayData ( DateTime, Inverter, Serial, CurrentPower, EtotalToday ) VALUES ( FROM_UNIXTIME(%ld),\'%s\',%ld,%0.f, %.3f ) ON DUPLICATE KEY UPDATE DateTime=Datetime, Inverter=VALUES(Inverter), Serial=VALUES(Serial), CurrentPower=VALUES(CurrentPower), EtotalToday=VALUES(EtotalToday)",(archdatalist+i)->date, (archdatalist+i)->inverter, (archdatalist+i)->serial, (archdatalist+i)->current_value, (archdatalist+i)->accum_value );
-	    if (flag.debug == 1) printf("%s\n",SQLQUERY);
+	    if (debug == 1) printf("%s\n",SQLQUERY);
 	    DoQuery(SQLQUERY);
-            //getchar();
         }
         mysql_close(conn);
+    }
 
-        char 			batch_string[400];
-        int			batch_count = 0;
-        unsigned long long 	inverter_serial;
+    curtime = time(NULL);  //get time in seconds since epoch (1/1/1970)	
+    loctime = localtime(&curtime);
+    day = loctime->tm_mday;
+    month = loctime->tm_mon +1;
+    year = loctime->tm_year + 1900;
+    hour = loctime->tm_hour;
+    minute = loctime->tm_min; 
+    datapoint = (int)(((hour * 60) + minute)) / 5; 
+
+    if ((post ==1)&&(mysql==1)&&(error==0)){
+        char batch_string[400];
+        int	batch_count = 0;
         
-        //Update Mysql with live data 
-        live_mysql( conf, flag, livedatalist, livedatalen );
-        printf( "\nbefore update to PVOutput" ); getchar();
         /* Connect to database */
         OpenMySqlDatabase( conf.MySqlHost, conf.MySqlUser, conf.MySqlPwd, conf.MySqlDatabase );
-	inverter_serial=(unit[0].Serial[0]<<24)+(unit[0].Serial[1]<<16)+(unit[0].Serial[2]<<8)+unit[0].Serial[3];
-        sprintf(SQLQUERY,"SELECT Value FROM LiveData WHERE Inverter = \'%s\' and Serial=\'%lld\' and Description=\'Max Phase 1\' ORDER BY DateTime DESC LIMIT 1", unit[0].Inverter, inverter_serial  );
-        if (flag.debug == 1) printf("%s\n",SQLQUERY); //getchar();
+        /*
+        //Get Start of day value
+        sprintf(SQLQUERY,"SELECT EtotalToday FROM DayData WHERE DateTime=DATE_FORMAT( NOW(), \"%%Y%%m%%d000000\" ) " );
+        if (debug == 1) printf("%s\n",SQLQUERY);
         DoQuery(SQLQUERY);
- 
-        if( mysql_num_rows(res) == 1 )
+        if (row = mysql_fetch_row(res))  //if there is a result, update the row
         {
-            if ((row = mysql_fetch_row(res)))
+            starttotal = atof( (char *)row[0] );
+    
+           /* if( archdatalen < 3 ) //Use Batch mode if greater
+           if ( 1 = 2 ) //Always use batch mode, r2 api is better and r1 may go away one day
+            
             {
-                max_output = atoi(row[0]) * 1.2;
+                for( i=1; i<archdatalen; i++ ) { //Start at 1 as the first record is a dummy
+                   if((archdatalist+i)->current_value > 0 )
+                   {
+	              dtotal = (archdatalist+i)->accum_value*1000 - (starttotal*1000);
+                      idate = (archdatalist+i)->date;
+	              loctime = localtime(&(archdatalist+i)->date);
+                      day = loctime->tm_mday;
+                      month = loctime->tm_mon +1;
+                      year = loctime->tm_year + 1900;
+                      hour = loctime->tm_hour;
+                      minute = loctime->tm_min; 
+                      second = loctime->tm_sec; 
+	              ret=sprintf(compurl,"%s?d=%04i%02i%02i&t=%02i:%02i&v1=%f&v2=%f&key=%s&sid=%s",conf.PVOutputURL,year,month,day,hour,minute,dtotal,(archdatalist+i)->current_value,conf.PVOutputKey,conf.PVOutputSid);
+                      sprintf(SQLQUERY,"SELECT PVOutput FROM DayData WHERE DateTime=\"%i%02i%02i%02i%02i%02i\"  and PVOutput IS NOT NULL", year, month, day, hour, minute, second );
+                      if (debug == 1) printf("%s\n",SQLQUERY);
+                      DoQuery(SQLQUERY);
+	              if (debug == 1) printf("url = %s\n",compurl); 
+                      if (row = mysql_fetch_row(res))  //if there is a result, already done
+                      {
+	                 if (verbose == 1) printf("Already Updated\n");
+                      }
+                      else
+                      {
+                    
+	                curl = curl_easy_init();
+	                if (curl){
+		             curl_easy_setopt(curl, CURLOPT_URL, compurl);
+		             curl_easy_setopt(curl, CURLOPT_FAILONERROR, compurl);
+		             result = curl_easy_perform(curl);
+	                     if (debug == 1) printf("result = %d\n",result);
+		             curl_easy_cleanup(curl);
+                             if( result==0 ) 
+                             {
+                                sprintf(SQLQUERY,"UPDATE DayData  set PVOutput=NOW() WHERE DateTime=\"%i%02i%02i%02i%02i%02i\"  ", year, month, day, hour, minute, second );
+                                if (debug == 1) printf("%s\n",SQLQUERY);
+                                DoQuery(SQLQUERY);
+                             }
+                             else
+                                break;
+		          
+	                }
+                     }
+                   }
+                }
             }
-            mysql_free_result( res );
-        }
-        sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), if( dd1.CurrentPower < %d ,dd1.CurrentPower, %d ), dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 13 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC", max_output, max_output );
-        if (flag.debug == 1) printf("%s\n",SQLQUERY);
+            else  //Use batch mode 30 values at a time!
+            */
+        // sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), dd1.CurrentPower, dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 29 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC" );
+	 // YJB 060812 -Don't rely on midnight time stamp 00:00:00        
+	 sprintf(SQLQUERY,"SELECT DATE_FORMAT(t1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(t1.DateTime,\'%%H:%%i\'), ROUND((t1.ETotalToday - d1.MinVal)*1000), t1.CurrentPower, t1.DateTime FROM DayData t1 INNER JOIN (SELECT DATE(DateTime) ts_date, MIN(ETotalToday) AS MinVal FROM DayData GROUP BY ts_date) d1 ON DATE(t1.DateTime) = d1.ts_date WHERE t1.DateTime>=Date_Sub(CURDATE(),INTERVAL 10 DAY) and t1.PVOutput IS NULL and t1.CurrentPower>0 ORDER BY t1.DateTime ASC" );
+	 if (debug == 1) printf("%s\n",SQLQUERY);
         DoQuery(SQLQUERY);
         batch_count=0;
         if( mysql_num_rows(res) == 1 )
@@ -1885,7 +2296,7 @@ int main(int argc, char **argv)
             if ((row = mysql_fetch_row(res)))  //Need to update these
             {
 	        sprintf(compurl,"%s?d=%s&t=%s&v1=%s&v2=%s&key=%s&sid=%s",conf.PVOutputURL,row[0],row[1],row[2],row[3],conf.PVOutputKey,conf.PVOutputSid);
-	        if (flag.debug == 1) printf("url = %s\n",compurl); 
+	        if (debug == 1) printf("url = %s\n",compurl); 
                 {
                     
 	            curl = curl_easy_init();
@@ -1893,12 +2304,12 @@ int main(int argc, char **argv)
 	                curl_easy_setopt(curl, CURLOPT_URL, compurl);
 		        curl_easy_setopt(curl, CURLOPT_FAILONERROR, compurl);
 		        result = curl_easy_perform(curl);
-	                if (flag.debug == 1) printf("result = %d\n",result);
+	                if (debug == 1) printf("result = %d\n",result);
 		        curl_easy_cleanup(curl);
                         if( result==0 ) 
                         {
                             sprintf(SQLQUERY,"UPDATE DayData  set PVOutput=NOW() WHERE DateTime=\"%s\"  ", row[4] );
-                            if (flag.debug == 1) printf("%s\n",SQLQUERY);
+                            if (debug == 1) printf("%s\n",SQLQUERY);
                             DoQuery(SQLQUERY);
                         }
 	            }
@@ -1920,22 +2331,24 @@ int main(int argc, char **argv)
 	            curl = curl_easy_init();
 	            if (curl){
 	                sprintf(compurl,"http://pvoutput.org/service/r2/addbatchstatus.jsp?data=%s&key=%s&sid=%s",batch_string,conf.PVOutputKey,conf.PVOutputSid);
-	                if (flag.debug == 1) printf("url = %s\n",compurl); 
+	                if (debug == 1) printf("url = %s\n",compurl); 
 	                curl_easy_setopt(curl, CURLOPT_URL, compurl);
 		        curl_easy_setopt(curl, CURLOPT_FAILONERROR, compurl);
 		        result = curl_easy_perform(curl);
                         sleep(1);
-	                if (flag.debug == 1) printf("result = %d\n",result);
+	                if (debug == 1) printf("result = %d\n",result);
 		        curl_easy_cleanup(curl);
                         if( result==0 ) 
                         {
-                           sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), dd1.CurrentPower, dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 13 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC limit %d", batch_count );
-                           if (flag.debug == 1) printf("%s\n",SQLQUERY);
+                           // sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), dd1.CurrentPower, dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 30 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC limit %d", batch_count );
+			      // YJB 060812 -Don't rely on midnight time stamp 00:00:00
+                           sprintf(SQLQUERY,"SELECT DATE_FORMAT(t1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(t1.DateTime,\'%%H:%%i\'), ROUND((t1.ETotalToday - d1.MinVal)*1000), t1.CurrentPower, t1.DateTime FROM DayData t1 INNER JOIN (SELECT DATE(DateTime) ts_date, MIN(ETotalToday) AS MinVal FROM DayData GROUP BY ts_date) d1 ON DATE(t1.DateTime) = d1.ts_date WHERE t1.DateTime>=Date_Sub(CURDATE(),INTERVAL 10 DAY) and t1.PVOutput IS NULL and t1.CurrentPower>0 ORDER BY t1.DateTime ASC" );
+			      if (debug == 1) printf("%s\n",SQLQUERY);
                            DoQuery1(SQLQUERY);
                            while ((row1 = mysql_fetch_row(res1)))  //Need to update these
                            {
                                sprintf(SQLQUERY,"UPDATE DayData set PVOutput=NOW() WHERE DateTime=\"%s\"  ", row1[4] );
-                               if (flag.debug == 1) printf("%s\n",SQLQUERY);
+                               if (debug == 1) printf("%s\n",SQLQUERY);
                                DoQuery2(SQLQUERY);
                            }
                            mysql_free_result( res1 );
@@ -1952,22 +2365,24 @@ int main(int argc, char **argv)
 	        curl = curl_easy_init();
 	        if (curl){
 	            sprintf(compurl,"http://pvoutput.org/service/r2/addbatchstatus.jsp?data=%s&key=%s&sid=%s",batch_string,conf.PVOutputKey,conf.PVOutputSid);
-	            if (flag.debug == 1) printf("url = %s\n",compurl); 
+	            if (debug == 1) printf("url = %s\n",compurl); 
 	            curl_easy_setopt(curl, CURLOPT_URL, compurl);
 	            curl_easy_setopt(curl, CURLOPT_FAILONERROR, compurl);
 	            result = curl_easy_perform(curl);
                     sleep(1);
-	            if (flag.debug == 1) printf("result = %d\n",result);
+	            if (debug == 1) printf("result = %d\n",result);
 		    curl_easy_cleanup(curl);
                     if( result==0 ) 
                     {
-                       sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), dd1.CurrentPower, dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 1 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC limit %d", batch_count );
-                       if (flag.debug == 1) printf("%s\n",SQLQUERY);
+                       // sprintf(SQLQUERY,"SELECT DATE_FORMAT(dd1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(dd1.DateTime,\'%%H:%%i\'), ROUND((dd1.ETotalToday-dd2.EtotalToday)*1000), dd1.CurrentPower, dd1.DateTime FROM DayData as dd1 join DayData as dd2 on dd2.DateTime=DATE_FORMAT(dd1.DateTime,\'%%Y-%%m-%%d 00:00:00\') WHERE dd1.DateTime>=Date_Sub(CURDATE(),INTERVAL 1 DAY) and dd1.PVOutput IS NULL and dd1.CurrentPower>0 ORDER BY dd1.DateTime ASC limit %d", batch_count );
+			  // YJB 060812 -Don't rely on midnight time stamp 00:00:00
+                       sprintf(SQLQUERY,"SELECT DATE_FORMAT(t1.DateTime,\'%%Y%%m%%d\'), DATE_FORMAT(t1.DateTime,\'%%H:%%i\'), ROUND((t1.ETotalToday - d1.MinVal)*1000), t1.CurrentPower, t1.DateTime FROM DayData t1 INNER JOIN (SELECT DATE(DateTime) ts_date, MIN(ETotalToday) AS MinVal FROM DayData GROUP BY ts_date) d1 ON DATE(t1.DateTime) = d1.ts_date WHERE t1.DateTime>=Date_Sub(CURDATE(),INTERVAL 10 DAY) and t1.PVOutput IS NULL and t1.CurrentPower>0 ORDER BY t1.DateTime ASC" );
+			  if (debug == 1) printf("%s\n",SQLQUERY);
                        DoQuery1(SQLQUERY);
                        while ((row1 = mysql_fetch_row(res1)))  //Need to update these
                        {
                            sprintf(SQLQUERY,"UPDATE DayData set PVOutput=NOW() WHERE DateTime=\"%s\"  ", row1[4] );
-                           if (flag.debug == 1) printf("%s\n",SQLQUERY);
+                           if (debug == 1) printf("%s\n",SQLQUERY);
                            DoQuery2(SQLQUERY);
                        }
                        mysql_free_result( res1 );
@@ -1980,16 +2395,14 @@ int main(int argc, char **argv)
         mysql_close(conn);
     }
 
-    if( archdatalen > 0 )
-        free( archdatalist );
-    archdatalen=0;
-    if( livedatalen > 0 )
-        free( livedatalist );
-    livedatalen=0;
-    close(s);
-    if ((flag.repost ==1)&&(error==0)){
-        printf( "\nrepost\n" ); //getchar();
-        sma_repost( &conf );
+  close(s);
+  if( archdatalen > 0 )
+      free( archdatalist );
+  archdatalen=0;
+  free(last_sent);
+}
+if ((repost ==1)&&(error==0)){
+    sma_repost( &conf, debug, verbose );
 }
 
 return 0;

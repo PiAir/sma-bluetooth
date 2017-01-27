@@ -1,3 +1,9 @@
 # Model specific data bluetooth inverter logger
 #
 #No longer used
+Inverter         1600TL
+Code1            0x36
+Code2            0xE1
+Code3            0x38
+Code4            0x3B
+InvCode          0x63
